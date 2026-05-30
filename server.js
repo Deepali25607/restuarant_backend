@@ -1677,6 +1677,16 @@ api.patch('/super-admin/invoices/:id', requirePerm('organizations.manage'), asyn
 
 app.use('/api', api)
 
+// Friendly health endpoint at the root so deploys / uptime checks don't see
+// a bare 404. The real surface lives under /api.
+app.get('/', (req, res) => {
+  res.json({
+    service: 'Masala Story API',
+    status: 'ok',
+    docs: '/api/platform/branding',
+  })
+})
+
 app.use((err, req, res, next) => {
   if (err instanceof PlanLimitError) {
     return res.status(402).json({

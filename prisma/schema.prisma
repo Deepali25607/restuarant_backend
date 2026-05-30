@@ -1,15 +1,17 @@
 // Masala Story — data model
 //
-// Local dev uses SQLite (zero setup, file: ./dev.db).
-// For production, change `provider` to `postgresql` and set DATABASE_URL
-// to a PostgreSQL connection string. Schema is compatible with both.
+// Production uses PostgreSQL (Render free tier or any managed Postgres).
+// Set DATABASE_URL to the connection string. The Linux binary target is
+// required so the Prisma engine generated on Windows still has the right
+// binary when Render runs the service on Debian.
 
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
