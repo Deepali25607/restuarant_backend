@@ -498,6 +498,98 @@ api.patch('/admin/orders/:id/status', requirePerm('orders.update'), asyncRoute(a
 }))
 
 // ── Admin: Menu CRUD ──────────────────────────────────────────────────
+// ── Menu categories ───────────────────────────────────────────────────
+api.get('/admin/categories', requirePerm('menu.manage'), asyncRoute(async (req, res) => {
+  const cats = await prisma.category.findMany({
+    where: orgScope(req),
+    orderBy: { order: 'asc' },
+  })
+  res.json(cats)
+}))
+
+api.post('/admin/categories', requirePerm('menu.manage'), asyncRoute(async (req, res) => {
+  const b = req.body || {}
+  const name = String(b.name || '').trim()
+  if (!name) return res.status(400).json({ message: 'name is required' })
+
+  // Default ordering: append to the end of the org's existing categories.
+  const last = await prisma.category.findFirst({
+    where: { organizationId: req.user.orgId },
+    orderBy: { order: 'desc' },
+    select: { order: true },
+  })
+  const order = Number.isFinite(b.order) ? Number(b.order) : (last?.order || 0) + 1
+
+  const created = await prisma.category.create({
+    data: {
+      id: `cat_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      organizationId: req.user.orgId,
+      name,
+      emoji: String(b.emoji || '🍽️').trim() || '🍽️',
+      order,
+    },
+  })
+  logAudit(req, {
+    action: 'create',
+    entity: 'category',
+    entityId: created.id,
+    summary: `Added category "${created.name}"`,
+    metadata: { name: created.name, emoji: created.emoji },
+  })
+  res.status(201).json(created)
+}))
+
+api.patch('/admin/categories/:id', requirePerm('menu.manage'), asyncRoute(async (req, res) => {
+  const target = await prisma.category.findFirst({
+    where: { id: req.params.id, ...orgScope(req) },
+  })
+  if (!target) return res.status(404).json({ message: 'Category not found' })
+  const b = req.body || {}
+  const data = {}
+  if ('name' in b) {
+    const name = String(b.name || '').trim()
+    if (!name) return res.status(400).json({ message: 'name cannot be empty' })
+    data.name = name
+  }
+  if ('emoji' in b) data.emoji = String(b.emoji || '🍽️').trim() || '🍽️'
+  if ('order' in b && Number.isFinite(b.order)) data.order = Number(b.order)
+  const updated = await prisma.category.update({ where: { id: target.id }, data })
+  logAudit(req, {
+    action: 'update',
+    entity: 'category',
+    entityId: updated.id,
+    summary: `Edited category "${updated.name}"`,
+    metadata: { name: updated.name, emoji: updated.emoji },
+  })
+  res.json(updated)
+}))
+
+api.delete('/admin/categories/:id', requirePerm('menu.manage'), asyncRoute(async (req, res) => {
+  const target = await prisma.category.findFirst({
+    where: { id: req.params.id, ...orgScope(req) },
+  })
+  if (!target) return res.status(404).json({ message: 'Category not found' })
+  // Refuse to delete a category that still has dishes — orphaned dishes would
+  // break the menu (a dish's categoryId must point to a real category).
+  const dishCount = await prisma.dish.count({
+    where: { categoryId: target.id, ...orgScope(req) },
+  })
+  if (dishCount > 0) {
+    return res.status(409).json({
+      message: `Move or delete the ${dishCount} dish(es) in "${target.name}" first.`,
+    })
+  }
+  const removed = await prisma.category.delete({ where: { id: target.id } })
+  logAudit(req, {
+    action: 'delete',
+    entity: 'category',
+    entityId: removed.id,
+    summary: `Deleted category "${removed.name}"`,
+    metadata: { name: removed.name },
+  })
+  res.json(removed)
+}))
+
 api.post('/admin/menu', requirePerm('menu.manage'), asyncRoute(async (req, res) => {
   const d = req.body || {}
   if (!d.name || !d.categoryId || !d.price) {
@@ -1377,6 +1469,17 @@ api.post('/super-admin/organizations', requirePerm('organizations.manage'), asyn
   const dates = periodDatesFor(plan)
   const orgId = `org_${slug}_${Math.random().toString(36).slice(2, 6)}`
 
+  // Seed a starter set of menu categories so the new org's admin can add
+  // dishes immediately. Without at least one category, dish creation is
+  // blocked (a dish requires a categoryId that belongs to the org).
+  const seedCategories = [
+    { id: 'starters', name: 'Starters', emoji: '🍢', order: 1 },
+    { id: 'mains', name: 'Main Course', emoji: '🍛', order: 2 },
+    { id: 'breads', name: 'Breads & Rice', emoji: '🫓', order: 3 },
+    { id: 'desserts', name: 'Desserts', emoji: '🍮', order: 4 },
+    { id: 'beverages', name: 'Beverages', emoji: '🥤', order: 5 },
+  ]
+
   const [created, adminUser] = await prisma.$transaction([
     prisma.organization.create({
       data: {
@@ -1413,6 +1516,17 @@ api.post('/super-admin/organizations', requirePerm('organizations.manage'), asyn
         passwordHash: bcrypt.hashSync(adminPassword, 10),
       },
     }),
+    ...seedCategories.map((c) =>
+      prisma.category.create({
+        data: {
+          id: `${orgId}_${c.id}`,
+          organizationId: orgId,
+          name: c.name,
+          emoji: c.emoji,
+          order: c.order,
+        },
+      }),
+    ),
   ])
 
   logAudit(req, {
