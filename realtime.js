@@ -35,6 +35,14 @@ function emitPaymentUpdate(order) {
   ioRef.to('admin').emit('order:paid', order)
 }
 
+// Customer self-reported a QR payment — surface it to the billing desk so a
+// cashier can confirm. Distinct from order:paid (which is the cashier's
+// authoritative settlement).
+function emitPaymentClaim(order) {
+  if (!ioRef) return
+  ioRef.to('admin').emit('order:paymentClaimed', order)
+}
+
 function emitStockEvent(event, dish) {
   if (!ioRef) return
   ioRef.to('admin').emit(event, dish)
@@ -47,5 +55,6 @@ module.exports = {
   emitOrderUpdate,
   emitNewOrder,
   emitPaymentUpdate,
+  emitPaymentClaim,
   emitStockEvent,
 }

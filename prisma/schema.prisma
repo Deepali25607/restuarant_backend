@@ -23,6 +23,9 @@ model Organization {
   name               String
   slug               String    @unique // URL-friendly identifier used in customer links
   logoUrl            String    @default("")
+  // Static UPI/payment QR image the restaurant uploads. Shown to customers in
+  // the post-order "how would you like to pay" popup so they can scan & pay.
+  paymentQrUrl       String    @default("")
   themeColor         String    @default("#ea580c") // chilli orange — overridden per-tenant
   address            String    @default("")
   gstNumber          String    @default("")
@@ -152,6 +155,10 @@ model Order {
   paymentStatus     String      @default("pending")
   paymentPaidAt     DateTime?
   paymentAmountPaid Int?
+  // Set when the customer taps "I've paid by QR" in the post-order popup. It's
+  // an unverified self-report — the cashier still confirms from the billing
+  // desk — but it tells them which tables are waiting on a QR confirmation.
+  paymentClaimedAt  DateTime?
   subtotal          Int
   tax               Int
   tip               Int         @default(0)

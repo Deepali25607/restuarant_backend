@@ -22,6 +22,7 @@ function toApiOrder(o) {
       status: o.paymentStatus,
       paidAt: o.paymentPaidAt ? o.paymentPaidAt.toISOString() : undefined,
       amountPaid: o.paymentAmountPaid ?? undefined,
+      claimedAt: o.paymentClaimedAt ? o.paymentClaimedAt.toISOString() : undefined,
     },
     amounts: {
       subtotal: o.subtotal,

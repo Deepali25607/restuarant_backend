@@ -13,6 +13,7 @@ const {
   getOrder,
   listOrders,
   setOrderStatus,
+  setPaymentMethod,
   markPaid,
   saveRating,
   resumePendingOrders,
@@ -245,6 +246,7 @@ api.get('/organizations/:slugOrId/branding', asyncRoute(async (req, res) => {
     name: org.name,
     slug: org.slug,
     logoUrl: org.logoUrl,
+    paymentQrUrl: org.paymentQrUrl,
     themeColor: org.themeColor,
     address: org.address,
     gstNumber: org.gstNumber,
@@ -430,6 +432,23 @@ api.get('/orders/:id', asyncRoute(async (req, res) => {
   res.json(order)
 }))
 
+// Customer picks how they'll pay from the post-order popup (scan QR vs cash at
+// counter). Public + org-scoped; records intent only — the cashier still
+// confirms the actual payment from the billing desk.
+api.patch('/orders/:id/payment-method', asyncRoute(async (req, res) => {
+  const org = await resolveCustomerOrg(req, res)
+  if (!org) return
+  const { method } = req.body || {}
+  try {
+    const order = await setPaymentMethod(req.params.id, method, { organizationId: org.id })
+    if (!order) return res.status(404).json({ message: 'Order not found' })
+    res.json(order)
+  } catch (e) {
+    if (e.status === 400) return res.status(400).json({ message: e.message })
+    throw e
+  }
+}))
+
 api.post('/orders/:id/rating', asyncRoute(async (req, res) => {
   const org = await resolveCustomerOrg(req, res)
   if (!org) return
@@ -485,7 +504,15 @@ api.patch('/admin/orders/:id/status', requirePerm('orders.update'), asyncRoute(a
   if (!STATUS_FLOW.includes(status)) {
     return res.status(400).json({ message: 'Invalid status' })
   }
-  const updated = await setOrderStatus(req.params.id, status, { organizationId: req.user.orgId })
+  let updated
+  try {
+    updated = await setOrderStatus(req.params.id, status, { organizationId: req.user.orgId })
+  } catch (e) {
+    if (e.code === 'payment_required') {
+      return res.status(409).json({ message: e.message, code: e.code })
+    }
+    throw e
+  }
   if (!updated) return res.status(404).json({ message: 'Order not found' })
   logAudit(req, {
     action: 'status_change',
@@ -495,6 +522,59 @@ api.patch('/admin/orders/:id/status', requirePerm('orders.update'), asyncRoute(a
     metadata: { status, tableNo: updated.tableNo },
   })
   res.json(updated)
+}))
+
+// ── Admin: restaurant settings (self-service) ─────────────────────────
+// The tenant admin/manager edits their own org's customer-facing details —
+// notably the payment QR image shown in the post-order checkout popup. Always
+// scoped to the caller's own org; super-admins keep the broader
+// /super-admin/organizations endpoints for cross-tenant edits.
+const ORG_SETTINGS_FIELDS = [
+  'name', 'logoUrl', 'paymentQrUrl', 'themeColor',
+  'address', 'gstNumber', 'contactPhone', 'contactEmail',
+]
+
+function orgSettingsView(org) {
+  return {
+    id: org.id,
+    name: org.name,
+    slug: org.slug,
+    logoUrl: org.logoUrl,
+    paymentQrUrl: org.paymentQrUrl,
+    themeColor: org.themeColor,
+    address: org.address,
+    gstNumber: org.gstNumber,
+    contactPhone: org.contactPhone,
+    contactEmail: org.contactEmail,
+  }
+}
+
+api.get('/admin/organization', requirePerm('settings.manage'), asyncRoute(async (req, res) => {
+  const org = await prisma.organization.findUnique({ where: { id: req.user.orgId } })
+  if (!org) return res.status(404).json({ message: 'Organization not found' })
+  res.json(orgSettingsView(org))
+}))
+
+api.patch('/admin/organization', requirePerm('settings.manage'), asyncRoute(async (req, res) => {
+  const org = await prisma.organization.findUnique({ where: { id: req.user.orgId } })
+  if (!org) return res.status(404).json({ message: 'Organization not found' })
+  const b = req.body || {}
+  const data = {}
+  for (const key of ORG_SETTINGS_FIELDS) {
+    if (key in b) data[key] = String(b[key] ?? '')
+  }
+  if (!Object.keys(data).length) {
+    return res.status(400).json({ message: 'No editable fields supplied' })
+  }
+  const updated = await prisma.organization.update({ where: { id: org.id }, data })
+  logAudit(req, {
+    action: 'update',
+    entity: 'organization',
+    entityId: updated.id,
+    summary: 'Restaurant settings updated',
+    metadata: { fields: Object.keys(data) },
+  })
+  res.json(orgSettingsView(updated))
 }))
 
 // ── Admin: Menu CRUD ──────────────────────────────────────────────────
@@ -1292,6 +1372,24 @@ api.get('/admin/reports/summary', requirePerm('reports.view'), asyncRoute(async 
     paymentMix[m] = (paymentMix[m] || 0) + (o.total || 0)
   })
 
+  // Settlements: how customers actually paid. Based on *paid* orders (money
+  // collected) rather than served orders, broken down by method so the
+  // restaurant can see the QR-vs-cash split at a glance.
+  const SETTLE_METHODS = ['qr', 'counter', 'upi', 'card', 'razorpay']
+  const byMethod = Object.fromEntries(SETTLE_METHODS.map((m) => [m, { count: 0, amount: 0 }]))
+  let settledTotal = 0
+  let settledCount = 0
+  orders
+    .filter((o) => o.paymentStatus === 'paid')
+    .forEach((o) => {
+      const m = SETTLE_METHODS.includes(o.paymentMethod) ? o.paymentMethod : 'counter'
+      byMethod[m].count += 1
+      byMethod[m].amount += o.total || 0
+      settledTotal += o.total || 0
+      settledCount += 1
+    })
+  const settlements = { total: settledTotal, count: settledCount, byMethod }
+
   // Ratings cascade with Order, so filter ratings via their parent order's org.
   const ratings = await prisma.rating.findMany({
     where: {
@@ -1332,6 +1430,7 @@ api.get('/admin/reports/summary', requirePerm('reports.view'), asyncRoute(async 
     daily,
     popular,
     payments: paymentMix,
+    settlements,
     expensesByCategory,
     ratings: {
       count: ratings.length,

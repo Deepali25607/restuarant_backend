@@ -180,6 +180,14 @@ async function setOrderStatus(id, status, { organizationId } = {}) {
   const existing = await prisma.order.findUnique({ where: { id } })
   if (!existing) return null
   if (organizationId && existing.organizationId !== organizationId) return null
+  // Payment gate: an order stays at 'received' until the cashier confirms
+  // payment. Only then can the kitchen push it forward (queued → … → served).
+  if (status !== 'received' && existing.paymentStatus !== 'paid') {
+    const err = new Error('Confirm payment at the Cashier desk before sending this order to the kitchen')
+    err.status = 409
+    err.code = 'payment_required'
+    throw err
+  }
   try {
     const updated = await prisma.order.update({
       where: { id },
@@ -192,6 +200,45 @@ async function setOrderStatus(id, status, { organizationId } = {}) {
   } catch {
     return null
   }
+}
+
+// Records the customer's chosen payment method after they place the order
+// (e.g. "qr" to pay by scanning the restaurant's QR, or "counter" for cash).
+// Purely informational for the cashier — it never marks the order paid. Only
+// mutable while the order is unpaid; once a cashier settles it, the recorded
+// method is authoritative and a late client tap must not overwrite it.
+async function setPaymentMethod(id, method, { organizationId } = {}) {
+  const ALLOWED = ['qr', 'counter', 'upi', 'card', 'razorpay']
+  if (!ALLOWED.includes(method)) {
+    const err = new Error('Invalid payment method')
+    err.status = 400
+    throw err
+  }
+  const existing = await prisma.order.findUnique({ where: { id } })
+  if (!existing) return null
+  if (organizationId && existing.organizationId !== organizationId) return null
+  if (existing.paymentStatus === 'paid') {
+    const fresh = await prisma.order.findUnique({
+      where: { id },
+      include: { items: true, rating: true },
+    })
+    return toApiOrder(fresh)
+  }
+  // Picking "qr" means the customer tapped "I've paid by QR" — stamp the claim
+  // so the cashier sees a standing "confirm this" flag even if they weren't
+  // watching when it happened.
+  const claimed = method === 'qr'
+  const data = { paymentMethod: method }
+  if (claimed) data.paymentClaimedAt = new Date()
+  const updated = await prisma.order.update({
+    where: { id },
+    data,
+    include: { items: true, rating: true },
+  })
+  const api = toApiOrder(updated)
+  realtime.emitOrderUpdate(api)
+  if (claimed) realtime.emitPaymentClaim(api)
+  return api
 }
 
 async function markPaid(id, { method, tip, amountPaid, loyaltyPhone, organizationId }) {
@@ -226,6 +273,11 @@ async function markPaid(id, { method, tip, amountPaid, loyaltyPhone, organizatio
   })
   const api = toApiOrder(fresh || updated)
   realtime.emitPaymentUpdate(api)
+  // Payment just cleared — start the auto-progress clock now (no-op when
+  // auto-progress is disabled; orders then wait for a manual push).
+  if (existing.paymentStatus !== 'paid') {
+    scheduleOrderProgress(api)
+  }
   return api
 }
 
@@ -261,9 +313,15 @@ async function scheduleOrderProgress(order) {
       if (!fresh.autoProgress) return
       const current = await prisma.order.findUnique({ where: { id: order.id } })
       if (!current) return
+      // Respect the payment gate — don't auto-advance an unpaid order.
+      if (current.paymentStatus !== 'paid') return
       const curIdx = STATUS_FLOW.indexOf(current.status)
       if (curIdx >= i + 1) return
-      await setOrderStatus(order.id, targetStatus)
+      try {
+        await setOrderStatus(order.id, targetStatus)
+      } catch {
+        /* gate or race — leave it for the next tick / manual push */
+      }
     }, stepMs * (i + 1))
   })
 }
@@ -291,6 +349,7 @@ module.exports = {
   getOrder,
   listOrders,
   setOrderStatus,
+  setPaymentMethod,
   markPaid,
   saveRating,
   resumePendingOrders,

@@ -29,6 +29,8 @@ const PERMISSIONS = [
 
   { group: 'Billing', key: 'billing.collect', label: 'Take payments & split' },
 
+  { group: 'Settings', key: 'settings.manage', label: 'Manage restaurant settings & payment QR' },
+
   { group: 'Expenses', key: 'expenses.view', label: 'View expenses' },
   { group: 'Expenses', key: 'expenses.manage', label: 'Add / edit expenses' },
   { group: 'Expenses', key: 'expenses.delete', label: 'Delete expenses' },
@@ -68,6 +70,7 @@ const ROLE_PERMISSIONS = {
     'loyalty.view',
     'audit.view',
     'staff.view',
+    'settings.manage',
   ],
   cashier: [
     'dashboard.view',
