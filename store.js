@@ -16,6 +16,12 @@ async function createOrder(payload) {
     throw err
   }
   const id = `o_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+  // Takeaway has no table/room; give it a short human-friendly pickup token so
+  // staff can call it out and the customer knows which order to collect.
+  const serviceType = ['room', 'takeaway'].includes(payload.serviceType)
+    ? payload.serviceType
+    : 'table'
+  const tableNo = serviceType === 'takeaway' ? id.slice(-4).toUpperCase() : String(payload.tableNo)
   const activeCount = await prisma.order.count({
     where: { organizationId, status: { not: 'served' } },
   })
@@ -103,7 +109,8 @@ async function createOrder(payload) {
       data: {
         id,
         organizationId,
-        tableNo: String(payload.tableNo),
+        tableNo,
+        serviceType,
         sessionId: payload.sessionId || null,
         paymentMethod: payload.payment?.method || 'counter',
         paymentStatus: 'pending',

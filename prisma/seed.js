@@ -2,7 +2,7 @@
    with its own staff, categories, dishes, and tables. Safe to re-run. */
 require('dotenv').config()
 const { PrismaClient } = require('@prisma/client')
-const { categories, menu, tables } = require('../data/seed')
+const { categories, menu, tables, rooms } = require('../data/seed')
 const { platformUsers, staffForOrg } = require('../data/users')
 const { periodDatesFor, planMeta } = require('../billing')
 
@@ -135,6 +135,16 @@ async function seedOrg(org) {
       where: { id },
       update: { seats: t.seats, number: t.number, organizationId: org.id },
       create: { id, organizationId: org.id, number: t.number, seats: t.seats },
+    })
+  }
+
+  // Rooms — room-service locations, parallel to tables.
+  for (const r of rooms) {
+    const id = `${org.id}_r${r.number}`
+    await prisma.room.upsert({
+      where: { id },
+      update: { number: r.number, organizationId: org.id },
+      create: { id, organizationId: org.id, number: r.number },
     })
   }
 }

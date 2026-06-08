@@ -88,9 +88,11 @@ async function enforcePlanLimit(req, resource) {
     prisma.organization.findUnique({ where: { id: req.user.orgId } }),
     resource === 'tables'
       ? prisma.table.count({ where: { organizationId: req.user.orgId } })
-      : resource === 'users'
-        ? prisma.user.count({ where: { organizationId: req.user.orgId } })
-        : prisma.dish.count({ where: { organizationId: req.user.orgId } }),
+      : resource === 'rooms'
+        ? prisma.room.count({ where: { organizationId: req.user.orgId } })
+        : resource === 'users'
+          ? prisma.user.count({ where: { organizationId: req.user.orgId } })
+          : prisma.dish.count({ where: { organizationId: req.user.orgId } }),
   ])
   assertWithinLimit(org, resource, count)
 }
@@ -178,6 +180,38 @@ api.get('/auth/me', requirePerm(), asyncRoute(async (req, res) => {
   res.json(publicUser(u, organization))
 }))
 
+// Self-service password change — any signed-in user, gated by re-entering
+// their current password. requirePerm() (no args) just means "authenticated".
+api.post('/auth/change-password', requirePerm(), asyncRoute(async (req, res) => {
+  const { currentPassword, newPassword } = req.body || {}
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ message: 'Current and new password are required' })
+  }
+  if (String(newPassword).length < 6) {
+    return res.status(400).json({ message: 'New password must be at least 6 characters' })
+  }
+  const u = await prisma.user.findUnique({ where: { id: req.user.sub } })
+  if (!u) return res.status(404).json({ message: 'Account not found' })
+  const ok = await bcrypt.compare(String(currentPassword), u.passwordHash)
+  if (!ok) {
+    return res.status(400).json({ message: 'Current password is incorrect', code: 'bad_current_password' })
+  }
+  if (await bcrypt.compare(String(newPassword), u.passwordHash)) {
+    return res.status(400).json({ message: 'New password must be different from the current one' })
+  }
+  await prisma.user.update({
+    where: { id: u.id },
+    data: { passwordHash: bcrypt.hashSync(String(newPassword), 10) },
+  })
+  logAudit(req, {
+    action: 'password_change',
+    entity: 'user',
+    entityId: u.id,
+    summary: `${u.name} changed their password`,
+  })
+  res.json({ ok: true })
+}))
+
 // Tenant-facing usage gauge. Returns the per-resource used/limit pair so the
 // admin UI can show "12 / 20 tables" and surface a warning when the cap is
 // close. Super-admins targeting an org via x-target-org see that org's usage.
@@ -259,6 +293,9 @@ api.get('/organizations/:slugOrId/branding', asyncRoute(async (req, res) => {
     gstRate: org.gstRate,
     taxLabel: org.taxLabel,
     businessHours: safeParseHours(org.businessHours),
+    tableOrderingEnabled: org.tableOrderingEnabled,
+    roomOrderingEnabled: org.roomOrderingEnabled,
+    takeawayOrderingEnabled: org.takeawayOrderingEnabled,
   })
 }))
 
@@ -295,7 +332,7 @@ api.get('/tables/:no', asyncRoute(async (req, res) => {
   // the one supplied, the table is considered locked for this customer.
   const sessionId = String(req.query.sessionId || '').trim() || null
   const heldOrders = await prisma.order.findMany({
-    where: { organizationId: org.id, tableNo: req.params.no, paymentStatus: { not: 'paid' } },
+    where: { organizationId: org.id, tableNo: req.params.no, serviceType: 'table', paymentStatus: { not: 'paid' } },
     select: { id: true, sessionId: true, status: true, createdAt: true },
   })
   let occupiedBy = null
@@ -311,12 +348,80 @@ api.get('/tables/:no', asyncRoute(async (req, res) => {
   })
 }))
 
+// ── Room-service: customer-facing parallels of the table endpoints ──────
+api.get('/rooms/:no', asyncRoute(async (req, res) => {
+  const org = await resolveCustomerOrg(req, res)
+  if (!org) return
+  const room = await prisma.room.findUnique({
+    where: { organizationId_number: { organizationId: org.id, number: req.params.no } },
+  })
+  if (!room) return res.status(404).json({ message: 'Room not found' })
+  const sessionId = String(req.query.sessionId || '').trim() || null
+  const heldOrders = await prisma.order.findMany({
+    where: { organizationId: org.id, tableNo: req.params.no, serviceType: 'room', paymentStatus: { not: 'paid' } },
+    select: { id: true, sessionId: true },
+  })
+  let occupiedBy = null
+  if (heldOrders.length) {
+    const mine = sessionId && heldOrders.some((o) => o.sessionId === sessionId)
+    occupiedBy = mine ? 'self' : 'other'
+  }
+  res.json({
+    ...room,
+    status: occupiedBy ? 'occupied' : 'available',
+    occupiedBy,
+    activeOrderCount: heldOrders.length,
+  })
+}))
+
+api.get('/rooms/:no/tab', asyncRoute(async (req, res) => {
+  const org = await resolveCustomerOrg(req, res)
+  if (!org) return
+  const tableNo = String(req.params.no)
+  const rows = await prisma.order.findMany({
+    where: { organizationId: org.id, tableNo, serviceType: 'room', paymentStatus: { not: 'paid' } },
+    include: { items: true, rating: true },
+    orderBy: { createdAt: 'asc' },
+  })
+  const { toApiOrder } = require('./db')
+  const orders = rows.map(toApiOrder)
+  const totals = orders.reduce(
+    (acc, o) => {
+      acc.subtotal += o.amounts?.subtotal || 0
+      acc.tax += o.amounts?.tax || 0
+      acc.tip += o.amounts?.tip || 0
+      acc.discount += o.amounts?.discount || 0
+      acc.total += o.amounts?.total || 0
+      acc.items += (o.items || []).reduce((s, it) => s + (it.qty || 0), 0)
+      return acc
+    },
+    { subtotal: 0, tax: 0, tip: 0, discount: 0, total: 0, items: 0 },
+  )
+  res.json({
+    tableNo,
+    serviceType: 'room',
+    orderCount: orders.length,
+    totals,
+    orders: orders.map((o) => ({
+      id: o.id,
+      status: o.status,
+      createdAt: o.createdAt,
+      paymentStatus: o.paymentStatus,
+      etaMinutes: o.etaMinutes,
+      queuePosition: o.queuePosition,
+      amounts: o.amounts,
+      itemCount: (o.items || []).reduce((s, it) => s + (it.qty || 0), 0),
+      items: (o.items || []).map((it) => ({ name: it.name, qty: it.qty, price: it.price })),
+    })),
+  })
+}))
+
 api.get('/tables/:no/tab', asyncRoute(async (req, res) => {
   const org = await resolveCustomerOrg(req, res)
   if (!org) return
   const tableNo = String(req.params.no)
   const rows = await prisma.order.findMany({
-    where: { organizationId: org.id, tableNo, paymentStatus: { not: 'paid' } },
+    where: { organizationId: org.id, tableNo, serviceType: 'table', paymentStatus: { not: 'paid' } },
     include: { items: true, rating: true },
     orderBy: { createdAt: 'asc' },
   })
@@ -357,32 +462,56 @@ api.post('/orders', asyncRoute(async (req, res) => {
   const org = await resolveCustomerOrg(req, res)
   if (!org) return
   const { tableNo, sessionId, items, payment, amounts, loyalty: loyaltyInput } = req.body || {}
-  if (!tableNo || !Array.isArray(items) || !items.length) {
-    return res.status(400).json({ message: 'tableNo and items are required' })
+  const serviceType = ['room', 'takeaway'].includes(req.body?.serviceType)
+    ? req.body.serviceType
+    : 'table'
+  if (!Array.isArray(items) || !items.length) {
+    return res.status(400).json({ message: 'items are required' })
+  }
+  // Takeaway has no physical location; table/room require a number.
+  if (serviceType !== 'takeaway' && !tableNo) {
+    return res.status(400).json({ message: 'tableNo is required' })
   }
 
-  // Table-busy guard: refuse to take an order on a table that another
-  // customer (different sessionId) has an open tab on. Same-session adds
-  // to an existing tab are allowed.
-  const heldByOther = await prisma.order.findFirst({
-    where: {
-      organizationId: org.id,
-      tableNo: String(tableNo),
-      paymentStatus: { not: 'paid' },
-      ...(sessionId ? { sessionId: { not: sessionId } } : {}),
-    },
-  })
-  if (heldByOther) {
-    return res.status(409).json({
-      code: 'table_occupied',
-      message: `Table ${tableNo} is currently occupied by another customer. Please pick a different table.`,
+  // Channel gate: refuse orders for a service type the tenant has switched off.
+  if (serviceType === 'room' && !org.roomOrderingEnabled) {
+    return res.status(403).json({ code: 'channel_disabled', message: 'Room service is not available here.' })
+  }
+  if (serviceType === 'table' && !org.tableOrderingEnabled) {
+    return res.status(403).json({ code: 'channel_disabled', message: 'Table ordering is not available here.' })
+  }
+  if (serviceType === 'takeaway' && !org.takeawayOrderingEnabled) {
+    return res.status(403).json({ code: 'channel_disabled', message: 'Takeaway is not available here.' })
+  }
+
+  const label = serviceType === 'room' ? 'Room' : 'Table'
+
+  // Busy guard: refuse to take an order on a table/room that another customer
+  // (different sessionId) has an open tab on. Same-session adds are allowed.
+  // Takeaway orders are independent (no shared location) so they skip this.
+  if (serviceType !== 'takeaway') {
+    const heldByOther = await prisma.order.findFirst({
+      where: {
+        organizationId: org.id,
+        tableNo: String(tableNo),
+        serviceType,
+        paymentStatus: { not: 'paid' },
+        ...(sessionId ? { sessionId: { not: sessionId } } : {}),
+      },
     })
+    if (heldByOther) {
+      return res.status(409).json({
+        code: 'table_occupied',
+        message: `${label} ${tableNo} is currently occupied by another customer. Please pick a different ${label.toLowerCase()}.`,
+      })
+    }
   }
 
   try {
     const order = await createOrder({
       organizationId: org.id,
       tableNo,
+      serviceType,
       sessionId,
       items,
       payment,
@@ -534,6 +663,8 @@ const ORG_SETTINGS_FIELDS = [
   'address', 'gstNumber', 'contactPhone', 'contactEmail',
 ]
 
+const ORG_SETTINGS_BOOL_FIELDS = ['tableOrderingEnabled', 'roomOrderingEnabled', 'takeawayOrderingEnabled']
+
 function orgSettingsView(org) {
   return {
     id: org.id,
@@ -546,6 +677,9 @@ function orgSettingsView(org) {
     gstNumber: org.gstNumber,
     contactPhone: org.contactPhone,
     contactEmail: org.contactEmail,
+    tableOrderingEnabled: org.tableOrderingEnabled,
+    roomOrderingEnabled: org.roomOrderingEnabled,
+    takeawayOrderingEnabled: org.takeawayOrderingEnabled,
   }
 }
 
@@ -562,6 +696,9 @@ api.patch('/admin/organization', requirePerm('settings.manage'), asyncRoute(asyn
   const data = {}
   for (const key of ORG_SETTINGS_FIELDS) {
     if (key in b) data[key] = String(b[key] ?? '')
+  }
+  for (const key of ORG_SETTINGS_BOOL_FIELDS) {
+    if (key in b) data[key] = Boolean(b[key])
   }
   if (!Object.keys(data).length) {
     return res.status(400).json({ message: 'No editable fields supplied' })
@@ -831,8 +968,12 @@ api.get('/admin/billing/tables', requirePerm('billing.collect'), asyncRoute(asyn
   const grouped = new Map()
   orders.forEach((raw) => {
     const o = toApiOrder(raw)
-    const key = String(o.tableNo)
-    if (!grouped.has(key)) grouped.set(key, { tableNo: key, orders: [], total: 0 })
+    const serviceType = o.serviceType || 'table'
+    // Key by type+number so Table 5 and Room 5 are distinct bills.
+    const key = `${serviceType}:${o.tableNo}`
+    if (!grouped.has(key)) {
+      grouped.set(key, { tableNo: String(o.tableNo), serviceType, orders: [], total: 0 })
+    }
     const g = grouped.get(key)
     g.orders.push(o)
     g.total += o.amounts?.total || 0
@@ -847,7 +988,7 @@ api.post('/admin/orders/:id/pay', requirePerm('billing.collect'), asyncRoute(asy
     action: 'pay',
     entity: 'order',
     entityId: order.id,
-    summary: `Paid ₹${order.amounts.total} (${order.payment.method.toUpperCase()}) · T${order.tableNo}`,
+    summary: `Paid ₹${order.amounts.total} (${order.payment.method.toUpperCase()}) · ${order.serviceType === 'room' ? 'Room' : 'T'}${order.tableNo}`,
     metadata: { method: order.payment.method, total: order.amounts.total, tip: order.amounts.tip || 0 },
   })
   res.json(order)
@@ -912,10 +1053,21 @@ api.post('/admin/orders/:id/split', requirePerm('billing.collect'), asyncRoute(a
 // ── Admin: Tables ─────────────────────────────────────────────────────
 async function withOccupancy(table, organizationId) {
   const active = await prisma.order.findFirst({
-    where: { organizationId, tableNo: table.number, status: { not: 'served' } },
+    where: { organizationId, tableNo: table.number, serviceType: 'table', status: { not: 'served' } },
   })
   return {
     ...table,
+    status: active ? 'occupied' : 'available',
+    activeOrderId: active?.id || null,
+  }
+}
+
+async function withRoomOccupancy(room, organizationId) {
+  const active = await prisma.order.findFirst({
+    where: { organizationId, tableNo: room.number, serviceType: 'room', status: { not: 'served' } },
+  })
+  return {
+    ...room,
     status: active ? 'occupied' : 'available',
     activeOrderId: active?.id || null,
   }
@@ -969,7 +1121,7 @@ api.delete('/admin/tables/:number', requirePerm('tables.delete'), asyncRoute(asy
   })
   if (!target) return res.status(404).json({ message: 'Table not found' })
   const occupied = await prisma.order.findFirst({
-    where: { organizationId: req.user.orgId, tableNo: req.params.number, status: { not: 'served' } },
+    where: { organizationId: req.user.orgId, tableNo: req.params.number, serviceType: 'table', status: { not: 'served' } },
   })
   if (occupied) return res.status(409).json({ message: 'Cannot delete an occupied table' })
   const removed = await prisma.table.delete({ where: { id: target.id } })
@@ -978,6 +1130,55 @@ api.delete('/admin/tables/:number', requirePerm('tables.delete'), asyncRoute(asy
     entity: 'table',
     entityId: removed.number,
     summary: `Deleted Table ${removed.number}`,
+  })
+  res.json(removed)
+}))
+
+// ── Admin: Rooms (room-service parallel of tables) ────────────────────
+api.get('/admin/rooms', requirePerm('rooms.view'), asyncRoute(async (req, res) => {
+  const rooms = await prisma.room.findMany({ where: orgScope(req), orderBy: { number: 'asc' } })
+  res.json(await Promise.all(rooms.map((r) => withRoomOccupancy(r, req.user.orgId))))
+}))
+
+api.post('/admin/rooms', requirePerm('rooms.manage'), asyncRoute(async (req, res) => {
+  const { number } = req.body || {}
+  if (!number) return res.status(400).json({ message: 'number required' })
+  const existing = await prisma.room.findUnique({
+    where: { organizationId_number: { organizationId: req.user.orgId, number: String(number) } },
+  })
+  if (existing) return res.status(409).json({ message: 'Room number already exists' })
+  await enforcePlanLimit(req, 'rooms')
+  const created = await prisma.room.create({
+    data: {
+      id: `r_${req.user.orgId || 'platform'}_${Date.now()}_${Math.random().toString(36).slice(2, 4)}`,
+      organizationId: req.user.orgId,
+      number: String(number),
+    },
+  })
+  logAudit(req, {
+    action: 'create',
+    entity: 'room',
+    entityId: created.number,
+    summary: `Added Room ${created.number}`,
+  })
+  res.status(201).json(await withRoomOccupancy(created, req.user.orgId))
+}))
+
+api.delete('/admin/rooms/:number', requirePerm('rooms.delete'), asyncRoute(async (req, res) => {
+  const target = await prisma.room.findUnique({
+    where: { organizationId_number: { organizationId: req.user.orgId, number: req.params.number } },
+  })
+  if (!target) return res.status(404).json({ message: 'Room not found' })
+  const occupied = await prisma.order.findFirst({
+    where: { organizationId: req.user.orgId, tableNo: req.params.number, serviceType: 'room', status: { not: 'served' } },
+  })
+  if (occupied) return res.status(409).json({ message: 'Cannot delete an occupied room' })
+  const removed = await prisma.room.delete({ where: { id: target.id } })
+  logAudit(req, {
+    action: 'delete',
+    entity: 'room',
+    entityId: removed.number,
+    summary: `Deleted Room ${removed.number}`,
   })
   res.json(removed)
 }))
@@ -1390,6 +1591,28 @@ api.get('/admin/reports/summary', requirePerm('reports.view'), asyncRoute(async 
     })
   const settlements = { total: settledTotal, count: settledCount, byMethod }
 
+  // Service mix: tables (dine-in) vs rooms (room service). Based on served
+  // orders so it lines up with the revenue figure above.
+  const serviceMix = {
+    table: { orders: 0, revenue: 0 },
+    room: { orders: 0, revenue: 0 },
+    takeaway: { orders: 0, revenue: 0 },
+  }
+  // Per-room revenue, so a hotel can see which rooms order the most.
+  const roomMap = new Map()
+  completed.forEach((o) => {
+    const svc = serviceMix[o.serviceType] ? o.serviceType : 'table'
+    serviceMix[svc].orders += 1
+    serviceMix[svc].revenue += o.total || 0
+    if (svc === 'room') {
+      const prev = roomMap.get(o.tableNo) || { number: o.tableNo, orders: 0, revenue: 0 }
+      prev.orders += 1
+      prev.revenue += o.total || 0
+      roomMap.set(o.tableNo, prev)
+    }
+  })
+  const rooms = Array.from(roomMap.values()).sort((a, b) => b.revenue - a.revenue)
+
   // Ratings cascade with Order, so filter ratings via their parent order's org.
   const ratings = await prisma.rating.findMany({
     where: {
@@ -1431,6 +1654,8 @@ api.get('/admin/reports/summary', requirePerm('reports.view'), asyncRoute(async 
     popular,
     payments: paymentMix,
     settlements,
+    serviceMix,
+    rooms,
     expensesByCategory,
     ratings: {
       count: ratings.length,
@@ -1498,10 +1723,11 @@ api.get('/super-admin/overview', requirePerm('organizations.view'), asyncRoute(a
 api.get('/super-admin/organizations', requirePerm('organizations.view'), asyncRoute(async (req, res) => {
   const orgs = await prisma.organization.findMany({ orderBy: { createdAt: 'asc' } })
   const withStats = await Promise.all(orgs.map(async (o) => {
-    const [userCount, dishCount, tableCount, orderCount, revenue, invoiceAgg] = await Promise.all([
+    const [userCount, dishCount, tableCount, roomCount, orderCount, revenue, invoiceAgg] = await Promise.all([
       prisma.user.count({ where: { organizationId: o.id } }),
       prisma.dish.count({ where: { organizationId: o.id } }),
       prisma.table.count({ where: { organizationId: o.id } }),
+      prisma.room.count({ where: { organizationId: o.id } }),
       prisma.order.count({ where: { organizationId: o.id } }),
       prisma.order.aggregate({
         where: { organizationId: o.id, paymentStatus: 'paid' },
@@ -1519,6 +1745,7 @@ api.get('/super-admin/organizations', requirePerm('organizations.view'), asyncRo
       limits,
       usage: {
         tables: { used: tableCount, limit: limits.tables },
+        rooms: { used: roomCount, limit: limits.rooms },
         users: { used: userCount, limit: limits.users },
         dishes: { used: dishCount, limit: limits.dishes },
       },
@@ -1526,6 +1753,7 @@ api.get('/super-admin/organizations', requirePerm('organizations.view'), asyncRo
         users: userCount,
         dishes: dishCount,
         tables: tableCount,
+        rooms: roomCount,
         orders: orderCount,
         revenue: revenue._sum?.total || 0,
         invoiceCount: invoiceAgg._count?._all || 0,
@@ -1640,10 +1868,11 @@ api.post('/super-admin/organizations', requirePerm('organizations.manage'), asyn
     limits: effectiveLimits(created),
     usage: {
       tables: { used: 0, limit: effectiveLimits(created).tables },
+      rooms: { used: 0, limit: effectiveLimits(created).rooms },
       users: { used: 1, limit: effectiveLimits(created).users },
       dishes: { used: 0, limit: effectiveLimits(created).dishes },
     },
-    stats: { users: 1, dishes: 0, tables: 0, orders: 0, revenue: 0, invoiceCount: 0, invoiceTotal: 0 },
+    stats: { users: 1, dishes: 0, tables: 0, rooms: 0, orders: 0, revenue: 0, invoiceCount: 0, invoiceTotal: 0 },
     admin: { id: adminUser.id, name: adminUser.name, email: adminUser.email },
   }))
 }))
@@ -1664,11 +1893,16 @@ api.patch('/super-admin/organizations/:id', requirePerm('organizations.manage'),
     data.businessHours = typeof b.businessHours === 'string' ? b.businessHours : JSON.stringify(b.businessHours || [])
   }
   if ('active' in b) data.active = Boolean(b.active)
+  // Ordering channels — platform admin can enable/disable table & room
+  // ordering on behalf of any organization.
+  for (const key of ORG_SETTINGS_BOOL_FIELDS) {
+    if (key in b) data[key] = Boolean(b[key])
+  }
   if ('slug' in b) data.slug = String(b.slug).toLowerCase().replace(/[^a-z0-9-]/g, '-')
   if (Number.isFinite(b.monthlyPrice)) data.monthlyPrice = b.monthlyPrice
   // Quota overrides. `null` removes the override and falls back to the plan
   // default; an integer pins the cap. Anything else is ignored.
-  for (const key of ['maxTables', 'maxUsers', 'maxDishes']) {
+  for (const key of ['maxTables', 'maxRooms', 'maxUsers', 'maxDishes']) {
     if (!(key in b)) continue
     if (b[key] === null) data[key] = null
     else if (Number.isFinite(b[key]) && b[key] >= 0) data[key] = b[key]

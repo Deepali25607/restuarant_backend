@@ -172,4 +172,9 @@ const tables = Array.from({ length: 20 }).map((_, i) => ({
   status: 'available',
 }))
 
-module.exports = { categories, menu, tables }
+// Room-service rooms, numbered hotel-style (101..108).
+const rooms = Array.from({ length: 8 }).map((_, i) => ({
+  number: String(101 + i),
+}))
+
+module.exports = { categories, menu, tables, rooms }

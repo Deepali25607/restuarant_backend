@@ -46,8 +46,15 @@ model Organization {
   // billing.PLAN_LIMITS. Set by super-admin when a tenant needs more or
   // fewer seats than their plan tier normally allows.
   maxTables          Int?
+  maxRooms           Int?
   maxUsers           Int?
   maxDishes          Int?
+  // Which ordering channels customers can use. Tables on by default; room
+  // service and takeaway are opt-in. Toggled from the tenant admin settings
+  // panel (and by the platform admin from the super-admin console).
+  tableOrderingEnabled    Boolean @default(true)
+  roomOrderingEnabled     Boolean @default(false)
+  takeawayOrderingEnabled Boolean @default(false)
   // Operational settings — applied to every order/receipt/dashboard for this
   // tenant. `gstRate` is a percentage (5 = 5%). `businessHours` is a JSON
   // array string of weekly slots e.g. [{ day: "mon", open: "10:00", close: "23:00" }].
@@ -146,10 +153,26 @@ model Table {
   @@index([organizationId])
 }
 
+// Room-service location — the room-ordering parallel to Table. Identified by a
+// number only (no seats). Orders placed from a room carry serviceType="room".
+model Room {
+  id             String @id
+  organizationId String?
+  number         String
+
+  @@unique([organizationId, number])
+  @@index([organizationId])
+}
+
 model Order {
   id                String      @id
   organizationId    String?
+  // Location the order was placed from. `tableNo` holds the number for both
+  // dine-in tables and room-service rooms; `serviceType` disambiguates.
+  // For dine-in/room this holds the table or room number. For takeaway there is
+  // no physical location, so it holds a short generated pickup token.
   tableNo           String
+  serviceType       String      @default("table") // "table" | "room" | "takeaway"
   sessionId         String?
   paymentMethod     String      @default("counter")
   paymentStatus     String      @default("pending")

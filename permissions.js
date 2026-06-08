@@ -27,6 +27,10 @@ const PERMISSIONS = [
   { group: 'Tables', key: 'tables.manage', label: 'Add / edit tables' },
   { group: 'Tables', key: 'tables.delete', label: 'Delete tables' },
 
+  { group: 'Rooms', key: 'rooms.view', label: 'View rooms' },
+  { group: 'Rooms', key: 'rooms.manage', label: 'Add / edit rooms' },
+  { group: 'Rooms', key: 'rooms.delete', label: 'Delete rooms' },
+
   { group: 'Billing', key: 'billing.collect', label: 'Take payments & split' },
 
   { group: 'Settings', key: 'settings.manage', label: 'Manage restaurant settings & payment QR' },
@@ -63,6 +67,8 @@ const ROLE_PERMISSIONS = {
     'media.upload',
     'tables.view',
     'tables.manage',
+    'rooms.view',
+    'rooms.manage',
     'billing.collect',
     'expenses.view',
     'expenses.manage',
@@ -77,6 +83,7 @@ const ROLE_PERMISSIONS = {
     'orders.view',
     'orders.update',
     'tables.view',
+    'rooms.view',
     'billing.collect',
     'loyalty.view',
   ],
@@ -85,6 +92,7 @@ const ROLE_PERMISSIONS = {
     'orders.view',
     'orders.update',
     'tables.view',
+    'rooms.view',
   ],
   kitchen: [
     'kitchen.view',

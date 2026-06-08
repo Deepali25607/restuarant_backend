@@ -9,6 +9,7 @@ function toApiOrder(o) {
   return {
     id: o.id,
     tableNo: o.tableNo,
+    serviceType: o.serviceType || 'table',
     sessionId: o.sessionId,
     items: (o.items || []).map((it) => ({
       dishId: it.dishId,

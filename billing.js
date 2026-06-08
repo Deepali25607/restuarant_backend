@@ -16,13 +16,13 @@ const PLANS = {
 // any of these via Organization.maxTables / maxUsers / maxDishes (see
 // effectiveLimits below).
 const PLAN_LIMITS = {
-  trial:      { tables: 5,    users: 3,    dishes: 30 },
-  monthly:    { tables: 20,   users: 10,   dishes: 100 },
-  yearly:     { tables: 30,   users: 15,   dishes: 200 },
-  enterprise: { tables: null, users: null, dishes: null },
+  trial:      { tables: 5,    rooms: 5,    users: 3,    dishes: 30 },
+  monthly:    { tables: 20,   rooms: 20,   users: 10,   dishes: 100 },
+  yearly:     { tables: 30,   rooms: 30,   users: 15,   dishes: 200 },
+  enterprise: { tables: null, rooms: null, users: null, dishes: null },
 }
 
-const LIMIT_RESOURCES = ['tables', 'users', 'dishes']
+const LIMIT_RESOURCES = ['tables', 'rooms', 'users', 'dishes']
 
 function planLimits(plan) {
   return PLAN_LIMITS[plan] || PLAN_LIMITS.trial
@@ -34,6 +34,7 @@ function effectiveLimits(org) {
   const base = planLimits(org?.subscriptionPlan)
   return {
     tables: Number.isFinite(org?.maxTables) ? org.maxTables : base.tables,
+    rooms: Number.isFinite(org?.maxRooms) ? org.maxRooms : base.rooms,
     users: Number.isFinite(org?.maxUsers) ? org.maxUsers : base.users,
     dishes: Number.isFinite(org?.maxDishes) ? org.maxDishes : base.dishes,
   }
