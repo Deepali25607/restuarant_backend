@@ -2152,8 +2152,12 @@ const io = new Server(server, { cors: { origin: '*' } })
 realtime.attach(io)
 
 const PORT = process.env.PORT || 5050
-server.listen(PORT, async () => {
-  console.log(`Masala Story API + Sockets → http://localhost:${PORT}`)
+// Bind to 0.0.0.0 (all IPv4 interfaces). Without an explicit host Node binds to
+// IPv6 "::" only, which Render's IPv4 port-scanner can't reach — causing the
+// "no open ports detected" deploy failure on the platform.
+const HOST = '0.0.0.0'
+server.listen(PORT, HOST, async () => {
+  console.log(`Masala Story API + Sockets → http://${HOST}:${PORT}`)
   try {
     await resumePendingOrders()
   } catch (e) {
