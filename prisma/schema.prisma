@@ -49,9 +49,17 @@ model Organization {
   maxRooms           Int?
   maxUsers           Int?
   maxDishes          Int?
-  // Which ordering channels customers can use. Tables on by default; room
-  // service and takeaway are opt-in. Toggled from the tenant admin settings
-  // panel (and by the platform admin from the super-admin console).
+  // Two layers of channel control:
+  //  • *OrderingAllowed (platform/plan): whether the tenant is ALLOWED to offer
+  //    a channel. NULL = follow the plan default (see billing.effectiveChannels);
+  //    the platform admin can pin true/false per tenant from the super-admin
+  //    console. A channel that isn't allowed is hidden from the tenant's own
+  //    settings and cannot be enabled or ordered from.
+  //  • *OrderingEnabled (tenant preference): whether the restaurant turns an
+  //    allowed channel on for customers. Effective availability = allowed && enabled.
+  tableOrderingAllowed    Boolean?
+  roomOrderingAllowed     Boolean?
+  takeawayOrderingAllowed Boolean?
   tableOrderingEnabled    Boolean @default(true)
   roomOrderingEnabled     Boolean @default(false)
   takeawayOrderingEnabled Boolean @default(false)
@@ -104,6 +112,9 @@ model User {
   role           String
   passwordHash   String
   permissions    String?
+  // Admins can deactivate a staff account without deleting it — a deactivated
+  // user keeps their data/history but cannot sign in until reactivated.
+  active         Boolean  @default(true)
   createdAt      DateTime @default(now())
 
   @@index([organizationId])

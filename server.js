@@ -19,7 +19,7 @@ const {
   resumePendingOrders,
   prisma,
 } = require('./store')
-const { login, requireAuth, publicUser } = require('./auth')
+const { login, requireAuth, sign, publicUser } = require('./auth')
 const {
   PERMISSIONS,
   ALL_PERMISSIONS,
@@ -43,6 +43,8 @@ const {
   periodDatesFor,
   billingSummary,
   effectiveLimits,
+  effectiveChannels,
+  publicPlans,
   assertWithinLimit,
   PlanLimitError,
   formatInvoiceNumber,
@@ -77,6 +79,9 @@ function shapeOrgForApi(org, extras = {}) {
     currentPeriodStart: org.currentPeriodStart ? new Date(org.currentPeriodStart).toISOString() : null,
     currentPeriodEnd: org.currentPeriodEnd ? new Date(org.currentPeriodEnd).toISOString() : null,
     businessHours: safeParseHours(org.businessHours),
+    // Effective channel entitlements (per-tenant override ?? plan default), so
+    // the super-admin console can show what the tenant is currently allowed.
+    allowedChannels: effectiveChannels(org),
     ...extras,
   }
 }
@@ -212,6 +217,275 @@ api.post('/auth/change-password', requirePerm(), asyncRoute(async (req, res) => 
   res.json({ ok: true })
 }))
 
+// ── Org provisioning + public self-service signup ─────────────────────
+// Starter menu categories so a brand-new org's admin can add dishes right
+// away (a dish needs a categoryId that belongs to its org).
+const SIGNUP_SEED_CATEGORIES = [
+  { id: 'starters', name: 'Starters', emoji: '🍢', order: 1 },
+  { id: 'mains', name: 'Main Course', emoji: '🍛', order: 2 },
+  { id: 'breads', name: 'Breads & Rice', emoji: '🫓', order: 3 },
+  { id: 'desserts', name: 'Desserts', emoji: '🍮', order: 4 },
+  { id: 'beverages', name: 'Beverages', emoji: '🥤', order: 5 },
+]
+
+// Default staff accounts provisioned with every new org. They start with their
+// role's baseline permissions (permissions = null) and a random placeholder
+// password — the admin sets real details from Staff Management before handing
+// them out. Roles map to the existing role-permission presets.
+const DEFAULT_STAFF = [
+  { role: 'manager', name: 'Manager' },
+  { role: 'kitchen', name: 'Kitchen Staff' },
+  { role: 'cashier', name: 'Cashier' },
+]
+
+const randomSecret = () =>
+  Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)
+
+function slugifyName(s) {
+  return String(s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+}
+
+// Derive a URL-safe slug from the org name, appending -2, -3… until unique.
+async function uniqueOrgSlug(base) {
+  const root = slugifyName(base) || 'restaurant'
+  let candidate = root
+  let n = 1
+  // eslint-disable-next-line no-await-in-loop
+  while (await prisma.organization.findUnique({ where: { slug: candidate } })) {
+    candidate = `${root}-${++n}`
+  }
+  return candidate
+}
+
+const httpError = (status, message, extra = {}) =>
+  Object.assign(new Error(message), { status, expose: true, ...extra })
+
+// Creates an organization + its first admin user + starter categories in one
+// transaction. Throws an HTTP-shaped error on validation failure. Shared by the
+// super-admin console and the public signup flow. `active=false` provisions a
+// pending org (used for paid plans awaiting payment).
+async function createOrgWithAdmin({ name, slug, admin, plan, monthlyPrice, active = true, orgExtra = {} }) {
+  if (!name) throw httpError(400, 'Organization name is required')
+  const finalSlug = String(slug || '').toLowerCase().replace(/[^a-z0-9-]/g, '-')
+  if (!finalSlug) throw httpError(400, 'A valid slug is required')
+  if (await prisma.organization.findUnique({ where: { slug: finalSlug } })) {
+    throw httpError(409, 'That web address is already taken — try a different name.')
+  }
+  const adminName = String(admin?.name || '').trim()
+  const adminEmail = String(admin?.email || '').trim().toLowerCase()
+  const adminPassword = String(admin?.password || '')
+  if (!adminName || !adminEmail || !adminPassword) {
+    throw httpError(400, 'First admin requires a name, email, and password.', { field: 'admin' })
+  }
+  if (adminPassword.length < 6) throw httpError(400, 'Admin password must be at least 6 characters.')
+  if (await prisma.user.findUnique({ where: { email: adminEmail } })) {
+    throw httpError(409, `Email "${adminEmail}" is already used by another account.`)
+  }
+
+  const safePlan = PLANS[plan] ? plan : 'trial'
+  const meta = planMeta(safePlan)
+  const dates = periodDatesFor(safePlan)
+  const orgId = `org_${finalSlug}_${Math.random().toString(36).slice(2, 6)}`
+
+  const [org, adminUser] = await prisma.$transaction([
+    prisma.organization.create({
+      data: {
+        id: orgId,
+        name: String(name),
+        slug: finalSlug,
+        logoUrl: String(orgExtra.logoUrl || ''),
+        themeColor: String(orgExtra.themeColor || '#ea580c'),
+        address: String(orgExtra.address || ''),
+        gstNumber: String(orgExtra.gstNumber || ''),
+        contactPhone: String(orgExtra.contactPhone || ''),
+        contactEmail: String(orgExtra.contactEmail || adminEmail),
+        subscriptionPlan: safePlan,
+        subscriptionStatus: !active ? 'incomplete' : safePlan === 'trial' ? 'trial' : 'active',
+        monthlyPrice: Number.isFinite(monthlyPrice) ? monthlyPrice : meta.monthlyPrice,
+        timezone: orgExtra.timezone ? String(orgExtra.timezone) : undefined,
+        locale: orgExtra.locale ? String(orgExtra.locale) : undefined,
+        currency: orgExtra.currency ? String(orgExtra.currency) : undefined,
+        currencySymbol: orgExtra.currencySymbol ? String(orgExtra.currencySymbol) : undefined,
+        gstRate: Number.isFinite(orgExtra.gstRate) ? orgExtra.gstRate : undefined,
+        taxLabel: orgExtra.taxLabel ? String(orgExtra.taxLabel) : undefined,
+        businessHours: orgExtra.businessHours ? JSON.stringify(orgExtra.businessHours) : undefined,
+        ...dates,
+        active,
+      },
+    }),
+    prisma.user.create({
+      data: {
+        id: `u_admin_${orgId}_${Math.random().toString(36).slice(2, 5)}`,
+        organizationId: orgId,
+        name: adminName,
+        email: adminEmail,
+        role: 'admin',
+        passwordHash: bcrypt.hashSync(adminPassword, 10),
+      },
+    }),
+    // Default staff roles — Manager, Kitchen, Cashier — managed afterwards from
+    // the Staff Management module (edit details, reset password, permissions,
+    // activate/deactivate). Emails derive from the unique orgId so they never
+    // clash; the admin can change them to real addresses later.
+    ...DEFAULT_STAFF.map((s) =>
+      prisma.user.create({
+        data: {
+          id: `u_${s.role}_${orgId}_${Math.random().toString(36).slice(2, 5)}`,
+          organizationId: orgId,
+          name: s.name,
+          email: `${s.role}@${orgId.replace(/_/g, '-')}.com`,
+          role: s.role,
+          passwordHash: bcrypt.hashSync(randomSecret(), 10),
+        },
+      }),
+    ),
+    ...SIGNUP_SEED_CATEGORIES.map((c) =>
+      prisma.category.create({
+        data: { id: `${orgId}_${c.id}`, organizationId: orgId, name: c.name, emoji: c.emoji, order: c.order },
+      }),
+    ),
+  ])
+  return { org, adminUser }
+}
+
+// Records a paid subscription invoice for an org (used after a successful
+// signup payment, and by the manual fallback when Razorpay isn't configured).
+async function recordPaidInvoice(org, { paymentMethod, notes }) {
+  const year = new Date().getFullYear()
+  const seq = (await prisma.invoice.count({ where: { number: { startsWith: `INV-${year}-` } } })) + 1
+  const periodStart = org.currentPeriodStart ? new Date(org.currentPeriodStart) : new Date()
+  const periodEnd = org.currentPeriodEnd
+    ? new Date(org.currentPeriodEnd)
+    : addDays(periodStart, planMeta(org.subscriptionPlan).durationDays || 30)
+  return prisma.invoice.create({
+    data: {
+      id: `inv_${Math.random().toString(36).slice(2, 10)}`,
+      organizationId: org.id,
+      number: formatInvoiceNumber(year, seq),
+      plan: org.subscriptionPlan,
+      amount: org.monthlyPrice || planMeta(org.subscriptionPlan).monthlyPrice,
+      currency: 'INR',
+      status: 'paid',
+      periodStart,
+      periodEnd,
+      dueAt: periodStart,
+      paidAt: new Date(),
+      paymentMethod: String(paymentMethod || ''),
+      notes: String(notes || 'Self-service signup'),
+    },
+  })
+}
+
+// Build the auth session (token + public user) returned on a successful signup
+// so the new admin lands straight in their dashboard.
+function sessionFor(user, organization) {
+  return { token: sign(user), user: publicUser(user, organization) }
+}
+
+// Public: the plans a visitor can compare & subscribe to.
+api.get('/public/plans', (req, res) => {
+  res.json({ plans: publicPlans(), payment: payments.status() })
+})
+
+// Public: create an organization from the signup form. Trial activates
+// immediately; paid plans return a Razorpay order to complete payment (or, when
+// Razorpay isn't configured, fall back to activating right away).
+api.post('/public/signup', asyncRoute(async (req, res) => {
+  const b = req.body || {}
+  const requestedPlan = String(b.plan || 'trial')
+  if (requestedPlan === 'enterprise') {
+    return res.status(400).json({ message: 'Enterprise plans are set up by our team — please contact sales.' })
+  }
+  const plan = PLANS[requestedPlan] && requestedPlan !== 'enterprise' ? requestedPlan : 'trial'
+  const orgName = String(b.org?.name || b.orgName || '').trim()
+  if (!orgName) return res.status(400).json({ message: 'Please enter your restaurant name.' })
+
+  const isPaid = planMeta(plan).billable
+  const slug = await uniqueOrgSlug(orgName)
+
+  try {
+    // Paid plan with Razorpay live → provision pending, collect payment first.
+    if (isPaid && payments.configured) {
+      const { org } = await createOrgWithAdmin({
+        name: orgName,
+        slug,
+        admin: b.admin,
+        plan,
+        active: false,
+        orgExtra: { contactPhone: b.admin?.phone },
+      })
+      const rzpOrder = await payments.createOrder({
+        amount: org.monthlyPrice,
+        receipt: org.id,
+        notes: { kind: 'subscription', orgId: org.id, plan },
+      })
+      return res.status(201).json({
+        requiresPayment: true,
+        orgId: org.id,
+        plan,
+        amount: org.monthlyPrice,
+        rzpOrder,
+        keyId: payments.status().keyId,
+      })
+    }
+
+    // Trial → free & instant. Paid-without-Razorpay → manual fallback: activate
+    // now and record the invoice as paid so the org is usable immediately.
+    const { org, adminUser } = await createOrgWithAdmin({
+      name: orgName,
+      slug,
+      admin: b.admin,
+      plan,
+      active: true,
+      orgExtra: { contactPhone: b.admin?.phone },
+    })
+    if (isPaid) await recordPaidInvoice(org, { paymentMethod: 'manual', notes: 'Signup (manual fallback)' })
+    return res.status(201).json({
+      requiresPayment: false,
+      fallback: isPaid,
+      organizationId: org.id,
+      ...sessionFor(adminUser, org),
+    })
+  } catch (e) {
+    if (e.status && e.expose) return res.status(e.status).json({ message: e.message, field: e.field })
+    throw e
+  }
+}))
+
+// Public: confirm a Razorpay subscription payment, then activate the org and
+// sign the new admin in.
+api.post('/public/signup/verify', asyncRoute(async (req, res) => {
+  const { orgId, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {}
+  if (!orgId) return res.status(400).json({ message: 'orgId is required' })
+  const ok = payments.verifySignature({
+    orderId: razorpay_order_id,
+    paymentId: razorpay_payment_id,
+    signature: razorpay_signature,
+  })
+  if (!ok) return res.status(400).json({ message: 'Payment could not be verified. Please contact support.' })
+
+  const org = await prisma.organization.findUnique({ where: { id: orgId } })
+  if (!org) return res.status(404).json({ message: 'Organization not found' })
+
+  // Activate (idempotent — re-verifying an already-active org is harmless).
+  const activated = org.active
+    ? org
+    : await prisma.organization.update({
+        where: { id: org.id },
+        data: { active: true, subscriptionStatus: 'active' },
+      })
+  if (!org.active) {
+    await recordPaidInvoice(activated, { paymentMethod: 'razorpay', notes: `Signup · ${razorpay_payment_id}` })
+  }
+
+  const adminUser = await prisma.user.findFirst({
+    where: { organizationId: org.id, role: 'admin' },
+    orderBy: { createdAt: 'asc' },
+  })
+  if (!adminUser) return res.status(500).json({ message: 'Admin account missing for this organization.' })
+  res.json({ organizationId: org.id, ...sessionFor(adminUser, activated) })
+}))
+
 // Tenant-facing usage gauge. Returns the per-resource used/limit pair so the
 // admin UI can show "12 / 20 tables" and surface a warning when the cap is
 // close. Super-admins targeting an org via x-target-org see that org's usage.
@@ -275,6 +549,9 @@ api.get('/organizations/:slugOrId/branding', asyncRoute(async (req, res) => {
   })
   if (!org) return res.status(404).json({ message: 'Organization not found' })
   if (!org.active) return res.status(403).json({ message: 'Organization is inactive' })
+  // Customers see a channel only when the plan allows it AND the restaurant
+  // has turned it on. A plan-restricted channel is never advertised.
+  const allowed = effectiveChannels(org)
   res.json({
     id: org.id,
     name: org.name,
@@ -293,9 +570,9 @@ api.get('/organizations/:slugOrId/branding', asyncRoute(async (req, res) => {
     gstRate: org.gstRate,
     taxLabel: org.taxLabel,
     businessHours: safeParseHours(org.businessHours),
-    tableOrderingEnabled: org.tableOrderingEnabled,
-    roomOrderingEnabled: org.roomOrderingEnabled,
-    takeawayOrderingEnabled: org.takeawayOrderingEnabled,
+    tableOrderingEnabled: allowed.table && org.tableOrderingEnabled,
+    roomOrderingEnabled: allowed.room && org.roomOrderingEnabled,
+    takeawayOrderingEnabled: allowed.takeaway && org.takeawayOrderingEnabled,
   })
 }))
 
@@ -473,15 +750,17 @@ api.post('/orders', asyncRoute(async (req, res) => {
     return res.status(400).json({ message: 'tableNo is required' })
   }
 
-  // Channel gate: refuse orders for a service type the tenant has switched off.
-  if (serviceType === 'room' && !org.roomOrderingEnabled) {
-    return res.status(403).json({ code: 'channel_disabled', message: 'Room service is not available here.' })
+  // Channel gate: refuse orders for a service type that the plan doesn't allow
+  // or the tenant has switched off. Effective availability = allowed && enabled.
+  const allowedChannels = effectiveChannels(org)
+  const channelEnabled = {
+    table: org.tableOrderingEnabled,
+    room: org.roomOrderingEnabled,
+    takeaway: org.takeawayOrderingEnabled,
   }
-  if (serviceType === 'table' && !org.tableOrderingEnabled) {
-    return res.status(403).json({ code: 'channel_disabled', message: 'Table ordering is not available here.' })
-  }
-  if (serviceType === 'takeaway' && !org.takeawayOrderingEnabled) {
-    return res.status(403).json({ code: 'channel_disabled', message: 'Takeaway is not available here.' })
+  if (!(allowedChannels[serviceType] && channelEnabled[serviceType])) {
+    const niceName = serviceType === 'room' ? 'Room service' : serviceType === 'takeaway' ? 'Takeaway' : 'Table ordering'
+    return res.status(403).json({ code: 'channel_disabled', message: `${niceName} is not available here.` })
   }
 
   const label = serviceType === 'room' ? 'Room' : 'Table'
@@ -680,6 +959,10 @@ function orgSettingsView(org) {
     tableOrderingEnabled: org.tableOrderingEnabled,
     roomOrderingEnabled: org.roomOrderingEnabled,
     takeawayOrderingEnabled: org.takeawayOrderingEnabled,
+    // Which channels the plan/platform allows. The tenant's settings UI hides
+    // toggles for channels that aren't allowed, and the PATCH below refuses to
+    // enable one. The platform admin controls this from the super-admin console.
+    allowedChannels: effectiveChannels(org),
   }
 }
 
@@ -697,8 +980,19 @@ api.patch('/admin/organization', requirePerm('settings.manage'), asyncRoute(asyn
   for (const key of ORG_SETTINGS_FIELDS) {
     if (key in b) data[key] = String(b[key] ?? '')
   }
+  // The tenant can only toggle channels their plan allows; trying to enable a
+  // restricted one is refused (the UI hides it, this is the server-side guard).
+  const allowed = effectiveChannels(org)
   for (const key of ORG_SETTINGS_BOOL_FIELDS) {
-    if (key in b) data[key] = Boolean(b[key])
+    if (!(key in b)) continue
+    const channel = key.replace('OrderingEnabled', '') // table | room | takeaway
+    if (b[key] && !allowed[channel]) {
+      return res.status(403).json({
+        code: 'channel_not_allowed',
+        message: `${channel.charAt(0).toUpperCase() + channel.slice(1)} ordering isn't included in your plan.`,
+      })
+    }
+    data[key] = Boolean(b[key])
   }
   if (!Object.keys(data).length) {
     return res.status(400).json({ message: 'No editable fields supplied' })
@@ -1231,7 +1525,7 @@ api.patch('/admin/staff/:id', requirePerm('staff.manage'), asyncRoute(async (req
   })
   if (!target) return res.status(404).json({ message: 'Staff not found' })
 
-  const { name, role, password } = req.body || {}
+  const { name, role, password, email, active } = req.body || {}
   const data = {}
   if (name) data.name = String(name)
   if (role) {
@@ -1241,11 +1535,28 @@ api.patch('/admin/staff/:id', requirePerm('staff.manage'), asyncRoute(async (req
     data.role = role
   }
   if (password) data.passwordHash = bcrypt.hashSync(String(password), 10)
+  // Email change (e.g. replacing an auto-generated default-staff address) —
+  // must stay globally unique.
+  if (email && String(email).toLowerCase() !== target.email) {
+    const next = String(email).toLowerCase()
+    const dup = await prisma.user.findUnique({ where: { email: next } })
+    if (dup) return res.status(409).json({ message: 'Email already used' })
+    data.email = next
+  }
+  // Activate / deactivate — but never let someone lock themselves out.
+  if (typeof active === 'boolean') {
+    if (target.id === req.user.sub && !active) {
+      return res.status(400).json({ message: 'You cannot deactivate your own account' })
+    }
+    data.active = active
+  }
   const updated = await prisma.user.update({ where: { id: target.id }, data })
   const changed = []
   if (name) changed.push('name')
   if (role) changed.push('role')
   if (password) changed.push('password')
+  if ('email' in data) changed.push('email')
+  if ('active' in data) changed.push(data.active ? 'activated' : 'deactivated')
   logAudit(req, {
     action: 'update',
     entity: 'staff',
@@ -1766,102 +2077,29 @@ api.get('/super-admin/organizations', requirePerm('organizations.view'), asyncRo
 
 api.post('/super-admin/organizations', requirePerm('organizations.manage'), asyncRoute(async (req, res) => {
   const b = req.body || {}
-  if (!b.name || !b.slug) return res.status(400).json({ message: 'name and slug are required' })
-  const slug = String(b.slug).toLowerCase().replace(/[^a-z0-9-]/g, '-')
-  const dup = await prisma.organization.findUnique({ where: { slug } })
-  if (dup) return res.status(409).json({ message: 'Slug already in use' })
-
-  // Bootstrap admin: required on create. Without one, nobody can sign in to
-  // the new org and the super-admin would have to manually insert a user.
-  const admin = b.admin || {}
-  const adminName = String(admin.name || '').trim()
-  const adminEmail = String(admin.email || '').trim().toLowerCase()
-  const adminPassword = String(admin.password || '')
-  if (!adminName || !adminEmail || !adminPassword) {
-    return res.status(400).json({
-      message: 'First admin requires a name, email, and password.',
-      field: 'admin',
-    })
-  }
-  if (adminPassword.length < 6) {
-    return res.status(400).json({ message: 'Admin password must be at least 6 characters.' })
-  }
-  const emailDup = await prisma.user.findUnique({ where: { email: adminEmail } })
-  if (emailDup) {
-    return res.status(409).json({ message: `Email "${adminEmail}" is already used by another account.` })
-  }
-
   const plan = PLANS[b.subscriptionPlan] ? b.subscriptionPlan : 'trial'
-  const meta = planMeta(plan)
-  const dates = periodDatesFor(plan)
-  const orgId = `org_${slug}_${Math.random().toString(36).slice(2, 6)}`
-
-  // Seed a starter set of menu categories so the new org's admin can add
-  // dishes immediately. Without at least one category, dish creation is
-  // blocked (a dish requires a categoryId that belongs to the org).
-  const seedCategories = [
-    { id: 'starters', name: 'Starters', emoji: '🍢', order: 1 },
-    { id: 'mains', name: 'Main Course', emoji: '🍛', order: 2 },
-    { id: 'breads', name: 'Breads & Rice', emoji: '🫓', order: 3 },
-    { id: 'desserts', name: 'Desserts', emoji: '🍮', order: 4 },
-    { id: 'beverages', name: 'Beverages', emoji: '🥤', order: 5 },
-  ]
-
-  const [created, adminUser] = await prisma.$transaction([
-    prisma.organization.create({
-      data: {
-        id: orgId,
-        name: String(b.name),
-        slug,
-        logoUrl: String(b.logoUrl || ''),
-        themeColor: String(b.themeColor || '#ea580c'),
-        address: String(b.address || ''),
-        gstNumber: String(b.gstNumber || ''),
-        contactPhone: String(b.contactPhone || ''),
-        contactEmail: String(b.contactEmail || ''),
-        subscriptionPlan: plan,
-        subscriptionStatus: plan === 'trial' ? 'trial' : 'active',
-        monthlyPrice: Number.isFinite(b.monthlyPrice) ? b.monthlyPrice : meta.monthlyPrice,
-        timezone: b.timezone ? String(b.timezone) : undefined,
-        locale: b.locale ? String(b.locale) : undefined,
-        currency: b.currency ? String(b.currency) : undefined,
-        currencySymbol: b.currencySymbol ? String(b.currencySymbol) : undefined,
-        gstRate: Number.isFinite(b.gstRate) ? b.gstRate : undefined,
-        taxLabel: b.taxLabel ? String(b.taxLabel) : undefined,
-        businessHours: b.businessHours ? JSON.stringify(b.businessHours) : undefined,
-        ...dates,
-        active: b.active !== false,
-      },
-    }),
-    prisma.user.create({
-      data: {
-        id: `u_admin_${orgId}_${Math.random().toString(36).slice(2, 5)}`,
-        organizationId: orgId,
-        name: adminName,
-        email: adminEmail,
-        role: 'admin',
-        passwordHash: bcrypt.hashSync(adminPassword, 10),
-      },
-    }),
-    ...seedCategories.map((c) =>
-      prisma.category.create({
-        data: {
-          id: `${orgId}_${c.id}`,
-          organizationId: orgId,
-          name: c.name,
-          emoji: c.emoji,
-          order: c.order,
-        },
-      }),
-    ),
-  ])
+  let created, adminUser
+  try {
+    ({ org: created, adminUser } = await createOrgWithAdmin({
+      name: b.name,
+      slug: b.slug,
+      admin: b.admin,
+      plan,
+      monthlyPrice: Number.isFinite(b.monthlyPrice) ? b.monthlyPrice : undefined,
+      active: b.active !== false,
+      orgExtra: b,
+    }))
+  } catch (e) {
+    if (e.status && e.expose) return res.status(e.status).json({ message: e.message, field: e.field })
+    throw e
+  }
 
   logAudit(req, {
     action: 'create',
     entity: 'organization',
     entityId: created.id,
-    summary: `Created organization "${created.name}" on ${plan} plan with admin ${adminEmail}`,
-    metadata: { slug: created.slug, plan, adminEmail },
+    summary: `Created organization "${created.name}" on ${plan} plan with admin ${adminUser.email}`,
+    metadata: { slug: created.slug, plan, adminEmail: adminUser.email },
   })
   res.status(201).json(shapeOrgForApi(created, {
     subscription: billingSummary(created),
@@ -1869,10 +2107,10 @@ api.post('/super-admin/organizations', requirePerm('organizations.manage'), asyn
     usage: {
       tables: { used: 0, limit: effectiveLimits(created).tables },
       rooms: { used: 0, limit: effectiveLimits(created).rooms },
-      users: { used: 1, limit: effectiveLimits(created).users },
+      users: { used: 1 + DEFAULT_STAFF.length, limit: effectiveLimits(created).users },
       dishes: { used: 0, limit: effectiveLimits(created).dishes },
     },
-    stats: { users: 1, dishes: 0, tables: 0, rooms: 0, orders: 0, revenue: 0, invoiceCount: 0, invoiceTotal: 0 },
+    stats: { users: 1 + DEFAULT_STAFF.length, dishes: 0, tables: 0, rooms: 0, orders: 0, revenue: 0, invoiceCount: 0, invoiceTotal: 0 },
     admin: { id: adminUser.id, name: adminUser.name, email: adminUser.email },
   }))
 }))
@@ -1893,10 +2131,13 @@ api.patch('/super-admin/organizations/:id', requirePerm('organizations.manage'),
     data.businessHours = typeof b.businessHours === 'string' ? b.businessHours : JSON.stringify(b.businessHours || [])
   }
   if ('active' in b) data.active = Boolean(b.active)
-  // Ordering channels — platform admin can enable/disable table & room
-  // ordering on behalf of any organization.
-  for (const key of ORG_SETTINGS_BOOL_FIELDS) {
-    if (key in b) data[key] = Boolean(b[key])
+  // Channel entitlements — the platform admin grants or revokes which ordering
+  // channels a tenant is ALLOWED to offer. `null` clears the override and falls
+  // back to the plan default; true/false pins it. A revoked channel is hidden
+  // from the tenant's own settings and can't be enabled or ordered from.
+  for (const key of ['tableOrderingAllowed', 'roomOrderingAllowed', 'takeawayOrderingAllowed']) {
+    if (!(key in b)) continue
+    data[key] = b[key] === null ? null : Boolean(b[key])
   }
   if ('slug' in b) data.slug = String(b.slug).toLowerCase().replace(/[^a-z0-9-]/g, '-')
   if (Number.isFinite(b.monthlyPrice)) data.monthlyPrice = b.monthlyPrice

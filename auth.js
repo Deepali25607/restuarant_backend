@@ -27,6 +27,7 @@ function publicUser(u, organization = null) {
     name: u.name,
     email: u.email,
     role: u.role,
+    active: u.active !== false,
     organizationId: u.organizationId || null,
     organization: organization
       ? {
@@ -73,6 +74,11 @@ async function login(email, password) {
   const ok = await bcrypt.compare(String(password), user.passwordHash)
   if (!ok) return null
 
+  // A deactivated staff account keeps its data but can't sign in.
+  if (user.active === false) {
+    return { error: 'This account has been deactivated. Please contact your administrator.' }
+  }
+
   // Block sign-in for tenant users whose organization has been deactivated
   // OR whose subscription has expired / been cancelled past the period end.
   let organization = null
@@ -113,4 +119,4 @@ function requireAuth() {
   }
 }
 
-module.exports = { login, requireAuth, publicUser, defaultsForRole }
+module.exports = { login, requireAuth, sign, publicUser, defaultsForRole }

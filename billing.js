@@ -16,7 +16,9 @@ const PLANS = {
 // any of these via Organization.maxTables / maxUsers / maxDishes (see
 // effectiveLimits below).
 const PLAN_LIMITS = {
-  trial:      { tables: 5,    rooms: 5,    users: 3,    dishes: 30 },
+  // Every new org is seeded with 4 accounts (admin + manager + kitchen +
+  // cashier), so the trial seat count leaves a little headroom above that.
+  trial:      { tables: 5,    rooms: 5,    users: 6,    dishes: 30 },
   monthly:    { tables: 20,   rooms: 20,   users: 10,   dishes: 100 },
   yearly:     { tables: 30,   rooms: 30,   users: 15,   dishes: 200 },
   enterprise: { tables: null, rooms: null, users: null, dishes: null },
@@ -24,8 +26,98 @@ const PLAN_LIMITS = {
 
 const LIMIT_RESOURCES = ['tables', 'rooms', 'users', 'dishes']
 
+// Ordering channels and which ones each plan allows by default. Table is a
+// baseline feature on every plan; Room service and Takeaway are paid-plan
+// features. A tenant row may override any channel via
+// Organization.<channel>OrderingAllowed (null = follow the plan default),
+// letting the platform admin grant or revoke a channel per restaurant.
+const ORDER_CHANNELS = ['table', 'room', 'takeaway']
+
+function planAllowsChannel(plan, channel) {
+  if (channel === 'table') return true
+  // Room & Takeaway: paid plans only (anything other than trial).
+  return (plan || 'trial') !== 'trial'
+}
+
+// Returns { table, room, takeaway } booleans — whether the tenant is *allowed*
+// to offer each channel. Per-tenant override wins; otherwise the plan default.
+function effectiveChannels(org) {
+  const plan = org?.subscriptionPlan || 'trial'
+  const override = {
+    table: org?.tableOrderingAllowed,
+    room: org?.roomOrderingAllowed,
+    takeaway: org?.takeawayOrderingAllowed,
+  }
+  const out = {}
+  for (const c of ORDER_CHANNELS) {
+    out[c] = override[c] == null ? planAllowsChannel(plan, c) : Boolean(override[c])
+  }
+  return out
+}
+
 function planLimits(plan) {
   return PLAN_LIMITS[plan] || PLAN_LIMITS.trial
+}
+
+// Plans a new user may self-serve at signup, with everything the public
+// pricing / comparison page needs: price, limits, allowed channels, and a
+// human feature list. Enterprise is surfaced as a "contact sales" card.
+const SIGNUP_PLAN_ORDER = ['trial', 'monthly', 'yearly', 'enterprise']
+
+function unlimitedOr(n, noun) {
+  return n == null ? `Unlimited ${noun}` : `${n} ${noun}`
+}
+
+function planChannels(plan) {
+  const out = {}
+  for (const c of ORDER_CHANNELS) out[c] = planAllowsChannel(plan, c)
+  return out
+}
+
+// A display-friendly bullet list of what a plan includes.
+function planFeatures(plan) {
+  const lim = planLimits(plan)
+  const ch = planChannels(plan)
+  const channelLabels = { table: 'Dine-in (tables)', room: 'Room service', takeaway: 'Takeaway' }
+  const channels = ORDER_CHANNELS.filter((c) => ch[c]).map((c) => channelLabels[c])
+  return [
+    unlimitedOr(lim.tables, 'tables'),
+    unlimitedOr(lim.rooms, 'rooms'),
+    unlimitedOr(lim.users, 'staff accounts'),
+    unlimitedOr(lim.dishes, 'menu items'),
+    `Ordering: ${channels.join(', ')}`,
+    'Live orders, kitchen & cashier consoles',
+    'Reports, loyalty & expenses',
+  ]
+}
+
+function publicPlans() {
+  return SIGNUP_PLAN_ORDER.map((key) => {
+    const meta = planMeta(key)
+    const contactSales = key === 'enterprise'
+    return {
+      key,
+      label: meta.label,
+      price: contactSales ? null : meta.monthlyPrice,
+      billable: meta.billable,
+      durationDays: meta.durationDays,
+      // How the price reads on the card.
+      priceNote:
+        key === 'trial'
+          ? `Free for ${meta.durationDays} days`
+          : key === 'yearly'
+            ? 'per month, billed yearly'
+            : key === 'monthly'
+              ? 'per month'
+              : 'Custom pricing',
+      contactSales,
+      selfServe: !contactSales,
+      recommended: key === 'yearly',
+      limits: planLimits(key),
+      channels: planChannels(key),
+      features: planFeatures(key),
+    }
+  })
 }
 
 // Returns { tables, users, dishes } — each value is a positive Int OR null
@@ -158,6 +250,10 @@ module.exports = {
   PLANS,
   PLAN_LIMITS,
   LIMIT_RESOURCES,
+  ORDER_CHANNELS,
+  planAllowsChannel,
+  effectiveChannels,
+  publicPlans,
   planMeta,
   planLimits,
   effectiveLimits,
