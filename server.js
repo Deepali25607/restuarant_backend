@@ -36,15 +36,18 @@ const { logAudit } = require('./audit')
 const loyalty = require('./loyalty')
 const platformBranding = require('./platform')
 const {
-  PLANS,
-  PLAN_LIMITS,
-  LIMIT_RESOURCES,
+  loadPlans,
+  planList,
+  planToRow,
+  planExists,
   planMeta,
   periodDatesFor,
   billingSummary,
   effectiveLimits,
   effectiveChannels,
   publicPlans,
+  couponDiscount,
+  couponUsable,
   assertWithinLimit,
   PlanLimitError,
   formatInvoiceNumber,
@@ -282,7 +285,7 @@ async function createOrgWithAdmin({ name, slug, admin, plan, monthlyPrice, activ
     throw httpError(409, `Email "${adminEmail}" is already used by another account.`)
   }
 
-  const safePlan = PLANS[plan] ? plan : 'trial'
+  const safePlan = planExists(plan) ? plan : 'trial'
   const meta = planMeta(safePlan)
   const dates = periodDatesFor(safePlan)
   const orgId = `org_${finalSlug}_${Math.random().toString(36).slice(2, 6)}`
@@ -300,7 +303,7 @@ async function createOrgWithAdmin({ name, slug, admin, plan, monthlyPrice, activ
         contactPhone: String(orgExtra.contactPhone || ''),
         contactEmail: String(orgExtra.contactEmail || adminEmail),
         subscriptionPlan: safePlan,
-        subscriptionStatus: !active ? 'incomplete' : safePlan === 'trial' ? 'trial' : 'active',
+        subscriptionStatus: !active ? 'incomplete' : planMeta(safePlan).isTrial ? 'trial' : 'active',
         monthlyPrice: Number.isFinite(monthlyPrice) ? monthlyPrice : meta.monthlyPrice,
         timezone: orgExtra.timezone ? String(orgExtra.timezone) : undefined,
         locale: orgExtra.locale ? String(orgExtra.locale) : undefined,
@@ -350,7 +353,7 @@ async function createOrgWithAdmin({ name, slug, admin, plan, monthlyPrice, activ
 
 // Records a paid subscription invoice for an org (used after a successful
 // signup payment, and by the manual fallback when Razorpay isn't configured).
-async function recordPaidInvoice(org, { paymentMethod, notes }) {
+async function recordPaidInvoice(org, { paymentMethod, notes, amount }) {
   const year = new Date().getFullYear()
   const seq = (await prisma.invoice.count({ where: { number: { startsWith: `INV-${year}-` } } })) + 1
   const periodStart = org.currentPeriodStart ? new Date(org.currentPeriodStart) : new Date()
@@ -363,7 +366,7 @@ async function recordPaidInvoice(org, { paymentMethod, notes }) {
       organizationId: org.id,
       number: formatInvoiceNumber(year, seq),
       plan: org.subscriptionPlan,
-      amount: org.monthlyPrice || planMeta(org.subscriptionPlan).monthlyPrice,
+      amount: Number.isFinite(amount) ? amount : (org.monthlyPrice || planMeta(org.subscriptionPlan).monthlyPrice),
       currency: 'INR',
       status: 'paid',
       periodStart,
@@ -374,6 +377,22 @@ async function recordPaidInvoice(org, { paymentMethod, notes }) {
       notes: String(notes || 'Self-service signup'),
     },
   })
+}
+
+// Resolve a signup coupon against a plan: returns the coupon row, the discount
+// it grants on the plan price, and the resulting charge. Returns a reason when
+// the code is present but unusable.
+async function resolveSignupCoupon(code, planId) {
+  const trimmed = String(code || '').trim()
+  const base = planMeta(planId).monthlyPrice
+  if (!trimmed) return { coupon: null, discount: 0, finalAmount: base }
+  const coupon = await prisma.coupon.findUnique({ where: { code: trimmed.toUpperCase() } })
+  const check = couponUsable(coupon, planId)
+  if (!coupon || !check.ok) {
+    return { coupon: null, discount: 0, finalAmount: base, error: check.reason || 'Invalid coupon code.' }
+  }
+  const discount = couponDiscount(coupon, base)
+  return { coupon, discount, finalAmount: Math.max(0, base - discount) }
 }
 
 // Build the auth session (token + public user) returned on a successful signup
@@ -387,25 +406,55 @@ api.get('/public/plans', (req, res) => {
   res.json({ plans: publicPlans(), payment: payments.status() })
 })
 
+// Public: check a coupon against a plan and preview the discount, so the signup
+// page can show the new price before the customer commits.
+api.post('/public/coupons/validate', asyncRoute(async (req, res) => {
+  const code = String(req.body?.code || '').trim()
+  const plan = String(req.body?.plan || '')
+  if (!code) return res.status(400).json({ valid: false, message: 'Enter a coupon code.' })
+  if (!planExists(plan) || !planMeta(plan).billable) {
+    return res.status(400).json({ valid: false, message: 'Coupons apply to paid plans only.' })
+  }
+  const { coupon, discount, finalAmount, error } = await resolveSignupCoupon(code, plan)
+  if (!coupon) return res.json({ valid: false, message: error || 'Invalid coupon code.' })
+  res.json({
+    valid: true,
+    code: coupon.code,
+    discountType: coupon.discountType,
+    discountValue: coupon.discountValue,
+    discount,
+    originalAmount: planMeta(plan).monthlyPrice,
+    finalAmount,
+    description: coupon.description,
+  })
+}))
+
 // Public: create an organization from the signup form. Trial activates
 // immediately; paid plans return a Razorpay order to complete payment (or, when
 // Razorpay isn't configured, fall back to activating right away).
 api.post('/public/signup', asyncRoute(async (req, res) => {
   const b = req.body || {}
   const requestedPlan = String(b.plan || 'trial')
-  if (requestedPlan === 'enterprise') {
-    return res.status(400).json({ message: 'Enterprise plans are set up by our team — please contact sales.' })
+  const plan = planExists(requestedPlan) ? requestedPlan : 'trial'
+  // Contact-sales plans (e.g. Enterprise) aren't self-serve.
+  if (planMeta(plan).contactSales || planMeta(plan).selfServe === false) {
+    return res.status(400).json({ message: 'This plan is set up by our team — please contact sales.' })
   }
-  const plan = PLANS[requestedPlan] && requestedPlan !== 'enterprise' ? requestedPlan : 'trial'
   const orgName = String(b.org?.name || b.orgName || '').trim()
   if (!orgName) return res.status(400).json({ message: 'Please enter your restaurant name.' })
 
   const isPaid = planMeta(plan).billable
+  // Apply a coupon (paid plans only — trial is already free).
+  const couponCode = isPaid ? b.coupon : ''
+  const { coupon, discount, finalAmount, error: couponError } = await resolveSignupCoupon(couponCode, plan)
+  if (couponCode && couponError) return res.status(400).json({ message: couponError, field: 'coupon' })
+  const chargeNote = coupon ? ` · coupon ${coupon.code} (−₹${discount})` : ''
   const slug = await uniqueOrgSlug(orgName)
 
   try {
     // Paid plan with Razorpay live → provision pending, collect payment first.
-    if (isPaid && payments.configured) {
+    // A 100%-off coupon makes the charge zero → skip Razorpay, activate now.
+    if (isPaid && payments.configured && finalAmount > 0) {
       const { org } = await createOrgWithAdmin({
         name: orgName,
         slug,
@@ -415,22 +464,23 @@ api.post('/public/signup', asyncRoute(async (req, res) => {
         orgExtra: { contactPhone: b.admin?.phone },
       })
       const rzpOrder = await payments.createOrder({
-        amount: org.monthlyPrice,
+        amount: finalAmount,
         receipt: org.id,
-        notes: { kind: 'subscription', orgId: org.id, plan },
+        notes: { kind: 'subscription', orgId: org.id, plan, coupon: coupon?.code || '' },
       })
       return res.status(201).json({
         requiresPayment: true,
         orgId: org.id,
         plan,
-        amount: org.monthlyPrice,
+        amount: finalAmount,
+        coupon: coupon ? { code: coupon.code, discount } : null,
         rzpOrder,
         keyId: payments.status().keyId,
       })
     }
 
-    // Trial → free & instant. Paid-without-Razorpay → manual fallback: activate
-    // now and record the invoice as paid so the org is usable immediately.
+    // Trial → free & instant. Paid-without-Razorpay (or fully discounted) →
+    // activate now and record the invoice so the org is usable immediately.
     const { org, adminUser } = await createOrgWithAdmin({
       name: orgName,
       slug,
@@ -439,11 +489,19 @@ api.post('/public/signup', asyncRoute(async (req, res) => {
       active: true,
       orgExtra: { contactPhone: b.admin?.phone },
     })
-    if (isPaid) await recordPaidInvoice(org, { paymentMethod: 'manual', notes: 'Signup (manual fallback)' })
+    if (isPaid) {
+      await recordPaidInvoice(org, {
+        paymentMethod: payments.configured ? 'coupon' : 'manual',
+        notes: `Signup${payments.configured ? '' : ' (manual fallback)'}${chargeNote}`,
+        amount: finalAmount,
+      })
+      if (coupon) await prisma.coupon.update({ where: { id: coupon.id }, data: { redemptions: { increment: 1 } } })
+    }
     return res.status(201).json({
       requiresPayment: false,
-      fallback: isPaid,
+      fallback: isPaid && !payments.configured,
       organizationId: org.id,
+      coupon: coupon ? { code: coupon.code, discount } : null,
       ...sessionFor(adminUser, org),
     })
   } catch (e) {
@@ -455,7 +513,7 @@ api.post('/public/signup', asyncRoute(async (req, res) => {
 // Public: confirm a Razorpay subscription payment, then activate the org and
 // sign the new admin in.
 api.post('/public/signup/verify', asyncRoute(async (req, res) => {
-  const { orgId, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {}
+  const { orgId, razorpay_order_id, razorpay_payment_id, razorpay_signature, coupon: couponCode } = req.body || {}
   if (!orgId) return res.status(400).json({ message: 'orgId is required' })
   const ok = payments.verifySignature({
     orderId: razorpay_order_id,
@@ -475,7 +533,15 @@ api.post('/public/signup/verify', asyncRoute(async (req, res) => {
         data: { active: true, subscriptionStatus: 'active' },
       })
   if (!org.active) {
-    await recordPaidInvoice(activated, { paymentMethod: 'razorpay', notes: `Signup · ${razorpay_payment_id}` })
+    // Re-resolve the coupon so the invoice records the amount actually charged
+    // and the redemption is counted once payment has succeeded.
+    const { coupon, discount, finalAmount } = await resolveSignupCoupon(couponCode, activated.subscriptionPlan)
+    await recordPaidInvoice(activated, {
+      paymentMethod: 'razorpay',
+      notes: `Signup · ${razorpay_payment_id}${coupon ? ` · coupon ${coupon.code} (−₹${discount})` : ''}`,
+      amount: finalAmount,
+    })
+    if (coupon) await prisma.coupon.update({ where: { id: coupon.id }, data: { redemptions: { increment: 1 } } })
   }
 
   const adminUser = await prisma.user.findFirst({
@@ -2007,7 +2073,7 @@ api.get('/super-admin/overview', requirePerm('organizations.view'), asyncRoute(a
   let pastDue = 0
   for (const o of orgsForBilling) {
     const s = billingSummary(o)
-    if (s.status === 'trial' || s.status === 'expiring' && o.subscriptionPlan === 'trial') trials++
+    if (s.status === 'trial' || s.status === 'expiring' && planMeta(o.subscriptionPlan).isTrial) trials++
     if (s.status === 'past_due') pastDue++
     if (!s.blocked && o.subscriptionPlan !== 'trial' && o.subscriptionPlan !== 'enterprise') {
       mrr += s.monthlyPrice || 0
@@ -2155,7 +2221,7 @@ api.patch('/super-admin/organizations/:id', requirePerm('organizations.manage'),
   if ('subscriptionPlan' in b && PLANS[b.subscriptionPlan] && b.subscriptionPlan !== before.subscriptionPlan) {
     const plan = b.subscriptionPlan
     data.subscriptionPlan = plan
-    data.subscriptionStatus = plan === 'trial' ? 'trial' : 'active'
+    data.subscriptionStatus = planMeta(plan).isTrial ? 'trial' : 'active'
     data.cancelAtPeriodEnd = false
     const meta = planMeta(plan)
     if (!Number.isFinite(b.monthlyPrice)) data.monthlyPrice = meta.monthlyPrice
@@ -2191,12 +2257,12 @@ api.post('/super-admin/organizations/:id/subscription/extend', requirePerm('orga
   }
   // Extend from whichever date is later: now, or the current period end.
   const now = new Date()
-  const ref = plan === 'trial'
+  const ref = meta.isTrial
     ? (org.trialEndsAt && org.trialEndsAt > now ? org.trialEndsAt : now)
     : (org.currentPeriodEnd && org.currentPeriodEnd > now ? org.currentPeriodEnd : now)
   const nextEnd = addDays(ref, meta.durationDays)
 
-  const patch = plan === 'trial'
+  const patch = meta.isTrial
     ? { trialEndsAt: nextEnd, subscriptionStatus: 'trial' }
     : {
         currentPeriodStart: org.currentPeriodEnd && org.currentPeriodEnd > now ? org.currentPeriodEnd : now,
@@ -2277,7 +2343,7 @@ api.post('/super-admin/organizations/:id/subscription/reactivate', requirePerm('
     where: { id: org.id },
     data: {
       ...dates,
-      subscriptionStatus: org.subscriptionPlan === 'trial' ? 'trial' : 'active',
+      subscriptionStatus: planMeta(org.subscriptionPlan).isTrial ? 'trial' : 'active',
       cancelAtPeriodEnd: false,
     },
   })
@@ -2363,6 +2429,140 @@ api.patch('/super-admin/invoices/:id', requirePerm('organizations.manage'), asyn
   res.json(updated)
 }))
 
+// ── Super Admin: subscription plans (managed catalog) ─────────────────
+const intOrNull = (v) =>
+  v === null || v === '' || v === undefined ? null : Number.isFinite(Number(v)) ? Math.max(0, Math.floor(Number(v))) : null
+
+function planBodyToRow(b, id) {
+  return {
+    id,
+    label: String(b.label || id),
+    monthlyPrice: Math.max(0, Math.floor(Number(b.monthlyPrice) || 0)),
+    durationDays: intOrNull(b.durationDays),
+    billable: !!b.billable,
+    isTrial: !!b.isTrial,
+    maxTables: intOrNull(b.limits ? b.limits.tables : b.maxTables),
+    maxRooms: intOrNull(b.limits ? b.limits.rooms : b.maxRooms),
+    maxUsers: intOrNull(b.limits ? b.limits.users : b.maxUsers),
+    maxDishes: intOrNull(b.limits ? b.limits.dishes : b.maxDishes),
+    channelTable: (b.channels ? b.channels.table : b.channelTable) !== false,
+    channelRoom: !!(b.channels ? b.channels.room : b.channelRoom),
+    channelTakeaway: !!(b.channels ? b.channels.takeaway : b.channelTakeaway),
+    contactSales: !!b.contactSales,
+    recommended: !!b.recommended,
+    selfServe: (b.selfServe === undefined ? true : b.selfServe) !== false,
+    sortOrder: Math.floor(Number(b.sortOrder) || 0),
+    active: (b.active === undefined ? true : b.active) !== false,
+  }
+}
+
+api.get('/super-admin/plans', requirePerm('organizations.view'), asyncRoute(async (req, res) => {
+  res.json({ plans: planList() })
+}))
+
+api.post('/super-admin/plans', requirePerm('organizations.manage'), asyncRoute(async (req, res) => {
+  const b = req.body || {}
+  const id = String(b.id || b.key || b.label || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  if (!id) return res.status(400).json({ message: 'A plan id/name is required.' })
+  if (planExists(id)) return res.status(409).json({ message: `A plan "${id}" already exists.` })
+  const created = await prisma.plan.create({ data: planBodyToRow(b, id) })
+  await loadPlans()
+  logAudit(req, { action: 'plan.create', entity: 'plan', entityId: created.id, summary: `Created plan "${created.label}"` })
+  res.status(201).json(planMeta(id))
+}))
+
+api.patch('/super-admin/plans/:id', requirePerm('organizations.manage'), asyncRoute(async (req, res) => {
+  const existing = await prisma.plan.findUnique({ where: { id: req.params.id } })
+  if (!existing) return res.status(404).json({ message: 'Plan not found' })
+  const row = planBodyToRow({ ...existing, ...req.body, limits: req.body?.limits, channels: req.body?.channels }, existing.id)
+  delete row.id
+  const updated = await prisma.plan.update({ where: { id: existing.id }, data: row })
+  await loadPlans()
+  logAudit(req, { action: 'plan.update', entity: 'plan', entityId: updated.id, summary: `Updated plan "${updated.label}"` })
+  res.json(planMeta(updated.id))
+}))
+
+api.delete('/super-admin/plans/:id', requirePerm('organizations.manage'), asyncRoute(async (req, res) => {
+  const existing = await prisma.plan.findUnique({ where: { id: req.params.id } })
+  if (!existing) return res.status(404).json({ message: 'Plan not found' })
+  const inUse = await prisma.organization.count({ where: { subscriptionPlan: existing.id } })
+  if (inUse) return res.status(409).json({ message: `Cannot delete "${existing.label}" — ${inUse} organization(s) are on it.` })
+  await prisma.plan.delete({ where: { id: existing.id } })
+  await loadPlans()
+  logAudit(req, { action: 'plan.delete', entity: 'plan', entityId: existing.id, summary: `Deleted plan "${existing.label}"` })
+  res.json({ ok: true })
+}))
+
+// ── Super Admin: subscription coupons ─────────────────────────────────
+function couponView(c) {
+  return {
+    id: c.id,
+    code: c.code,
+    description: c.description,
+    discountType: c.discountType,
+    discountValue: c.discountValue,
+    appliesToPlans: String(c.appliesToPlans || '').split(',').map((s) => s.trim()).filter(Boolean),
+    maxRedemptions: c.maxRedemptions,
+    redemptions: c.redemptions,
+    expiresAt: c.expiresAt ? new Date(c.expiresAt).toISOString() : null,
+    active: c.active,
+    createdAt: c.createdAt ? new Date(c.createdAt).toISOString() : null,
+  }
+}
+
+function couponBodyToData(b) {
+  const type = b.discountType === 'flat' ? 'flat' : 'percent'
+  let value = Math.floor(Number(b.discountValue) || 0)
+  value = type === 'percent' ? Math.max(1, Math.min(100, value)) : Math.max(1, value)
+  const plansCsv = Array.isArray(b.appliesToPlans)
+    ? b.appliesToPlans.filter(Boolean).join(',')
+    : String(b.appliesToPlans || '')
+  return {
+    description: String(b.description || ''),
+    discountType: type,
+    discountValue: value,
+    appliesToPlans: plansCsv,
+    maxRedemptions: intOrNull(b.maxRedemptions),
+    expiresAt: b.expiresAt ? new Date(b.expiresAt) : null,
+    active: b.active === undefined ? true : Boolean(b.active),
+  }
+}
+
+api.get('/super-admin/coupons', requirePerm('organizations.view'), asyncRoute(async (req, res) => {
+  const list = await prisma.coupon.findMany({ orderBy: { createdAt: 'desc' } })
+  res.json({ coupons: list.map(couponView) })
+}))
+
+api.post('/super-admin/coupons', requirePerm('organizations.manage'), asyncRoute(async (req, res) => {
+  const b = req.body || {}
+  const code = String(b.code || '').trim().toUpperCase().replace(/\s+/g, '')
+  if (!code) return res.status(400).json({ message: 'A coupon code is required.' })
+  if (await prisma.coupon.findUnique({ where: { code } })) {
+    return res.status(409).json({ message: `Coupon "${code}" already exists.` })
+  }
+  const created = await prisma.coupon.create({
+    data: { id: `cpn_${Math.random().toString(36).slice(2, 10)}`, code, ...couponBodyToData(b) },
+  })
+  logAudit(req, { action: 'coupon.create', entity: 'coupon', entityId: created.id, summary: `Created coupon ${created.code}` })
+  res.status(201).json(couponView(created))
+}))
+
+api.patch('/super-admin/coupons/:id', requirePerm('organizations.manage'), asyncRoute(async (req, res) => {
+  const existing = await prisma.coupon.findUnique({ where: { id: req.params.id } })
+  if (!existing) return res.status(404).json({ message: 'Coupon not found' })
+  const updated = await prisma.coupon.update({ where: { id: existing.id }, data: couponBodyToData({ ...existing, ...req.body }) })
+  logAudit(req, { action: 'coupon.update', entity: 'coupon', entityId: updated.id, summary: `Updated coupon ${updated.code}` })
+  res.json(couponView(updated))
+}))
+
+api.delete('/super-admin/coupons/:id', requirePerm('organizations.manage'), asyncRoute(async (req, res) => {
+  const existing = await prisma.coupon.findUnique({ where: { id: req.params.id } })
+  if (!existing) return res.status(404).json({ message: 'Coupon not found' })
+  await prisma.coupon.delete({ where: { id: existing.id } })
+  logAudit(req, { action: 'coupon.delete', entity: 'coupon', entityId: existing.id, summary: `Deleted coupon ${existing.code}` })
+  res.json({ ok: true })
+}))
+
 app.use('/api', api)
 
 // Friendly health endpoint at the root so deploys / uptime checks don't see
@@ -2399,6 +2599,13 @@ const PORT = process.env.PORT || 5050
 const HOST = '0.0.0.0'
 server.listen(PORT, HOST, async () => {
   console.log(`Masala Story API + Sockets → http://${HOST}:${PORT}`)
+  try {
+    // Load (and seed on first run) the subscription plans into the cache so the
+    // synchronous billing helpers serve live, admin-managed plan data.
+    await loadPlans()
+  } catch (e) {
+    console.error('Failed to load plans (using built-in defaults)', e)
+  }
   try {
     await resumePendingOrders()
   } catch (e) {

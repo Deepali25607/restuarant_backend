@@ -1,127 +1,104 @@
-// Subscription / billing helpers. Single source of truth for plan presets
-// and for deriving the *effective* subscription status from an org's stored
-// dates — so a stale `subscriptionStatus` field can't keep an expired tenant
-// alive after the renewal date passes.
+// Subscription / billing helpers.
+//
+// Plans are stored in the database (model Plan) and managed by the platform
+// admin. To keep the rest of the codebase synchronous, we hold an in-memory
+// cache of the plans, populated by loadPlans() at startup and refreshed after
+// any plan mutation. Until the cache is loaded (or if the DB is unreachable)
+// the built-in DEFAULT_PLANS act as a fallback so nothing breaks.
+
+const { prisma } = require('./db')
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
-const PLANS = {
-  trial: { label: 'Trial', durationDays: 14, monthlyPrice: 0, billable: false },
-  monthly: { label: 'Monthly', durationDays: 30, monthlyPrice: 2999, billable: true },
-  yearly: { label: 'Yearly', durationDays: 365, monthlyPrice: 2499, billable: true },
-  enterprise: { label: 'Enterprise', durationDays: null, monthlyPrice: 0, billable: false },
-}
-
-// Per-plan resource quotas. `null` means unlimited. Tenant rows may override
-// any of these via Organization.maxTables / maxUsers / maxDishes (see
-// effectiveLimits below).
-const PLAN_LIMITS = {
-  // Every new org is seeded with 4 accounts (admin + manager + kitchen +
-  // cashier), so the trial seat count leaves a little headroom above that.
-  trial:      { tables: 5,    rooms: 5,    users: 6,    dishes: 30 },
-  monthly:    { tables: 20,   rooms: 20,   users: 10,   dishes: 100 },
-  yearly:     { tables: 30,   rooms: 30,   users: 15,   dishes: 200 },
-  enterprise: { tables: null, rooms: null, users: null, dishes: null },
-}
-
 const LIMIT_RESOURCES = ['tables', 'rooms', 'users', 'dishes']
-
-// Ordering channels and which ones each plan allows by default. Table is a
-// baseline feature on every plan; Room service and Takeaway are paid-plan
-// features. A tenant row may override any channel via
-// Organization.<channel>OrderingAllowed (null = follow the plan default),
-// letting the platform admin grant or revoke a channel per restaurant.
 const ORDER_CHANNELS = ['table', 'room', 'takeaway']
 
-function planAllowsChannel(plan, channel) {
-  if (channel === 'table') return true
-  // Room & Takeaway: paid plans only (anything other than trial).
-  return (plan || 'trial') !== 'trial'
-}
+// Built-in plans. Seeded into the DB on first run and used as a fallback before
+// the cache loads. Field shape matches the Plan model.
+const DEFAULT_PLANS = [
+  { id: 'trial', label: 'Trial', monthlyPrice: 0, durationDays: 14, billable: false, isTrial: true, maxTables: 5, maxRooms: 5, maxUsers: 6, maxDishes: 30, channelTable: true, channelRoom: false, channelTakeaway: false, contactSales: false, recommended: false, selfServe: true, sortOrder: 1, active: true },
+  { id: 'monthly', label: 'Monthly', monthlyPrice: 2999, durationDays: 30, billable: true, isTrial: false, maxTables: 20, maxRooms: 20, maxUsers: 10, maxDishes: 100, channelTable: true, channelRoom: true, channelTakeaway: true, contactSales: false, recommended: false, selfServe: true, sortOrder: 2, active: true },
+  { id: 'yearly', label: 'Yearly', monthlyPrice: 2499, durationDays: 365, billable: true, isTrial: false, maxTables: 30, maxRooms: 30, maxUsers: 15, maxDishes: 200, channelTable: true, channelRoom: true, channelTakeaway: true, contactSales: false, recommended: true, selfServe: true, sortOrder: 3, active: true },
+  { id: 'enterprise', label: 'Enterprise', monthlyPrice: 0, durationDays: null, billable: false, isTrial: false, maxTables: null, maxRooms: null, maxUsers: null, maxDishes: null, channelTable: true, channelRoom: true, channelTakeaway: true, contactSales: true, recommended: false, selfServe: false, sortOrder: 4, active: true },
+]
 
-// Returns { table, room, takeaway } booleans — whether the tenant is *allowed*
-// to offer each channel. Per-tenant override wins; otherwise the plan default.
-function effectiveChannels(org) {
-  const plan = org?.subscriptionPlan || 'trial'
-  const override = {
-    table: org?.tableOrderingAllowed,
-    room: org?.roomOrderingAllowed,
-    takeaway: org?.takeawayOrderingAllowed,
+// Normalize a Plan row (DB or default) into the in-memory shape callers use.
+function normPlan(row) {
+  return {
+    id: row.id,
+    key: row.id,
+    label: row.label,
+    monthlyPrice: row.monthlyPrice || 0,
+    durationDays: row.durationDays == null ? null : row.durationDays,
+    billable: !!row.billable,
+    isTrial: !!row.isTrial,
+    contactSales: !!row.contactSales,
+    recommended: !!row.recommended,
+    selfServe: row.selfServe !== false,
+    active: row.active !== false,
+    sortOrder: row.sortOrder || 0,
+    limits: {
+      tables: row.maxTables == null ? null : row.maxTables,
+      rooms: row.maxRooms == null ? null : row.maxRooms,
+      users: row.maxUsers == null ? null : row.maxUsers,
+      dishes: row.maxDishes == null ? null : row.maxDishes,
+    },
+    channels: {
+      table: row.channelTable !== false,
+      room: !!row.channelRoom,
+      takeaway: !!row.channelTakeaway,
+    },
   }
-  const out = {}
-  for (const c of ORDER_CHANNELS) {
-    out[c] = override[c] == null ? planAllowsChannel(plan, c) : Boolean(override[c])
+}
+
+let PLAN_CACHE = null
+
+function fallbackCache() {
+  const m = {}
+  for (const r of DEFAULT_PLANS) m[r.id] = normPlan(r)
+  return m
+}
+
+// Current plan map (id -> normalized plan). Falls back to defaults pre-load.
+function plans() {
+  return PLAN_CACHE || fallbackCache()
+}
+
+// Load (and seed on first run) plans from the DB into the cache. Called at
+// startup and after any plan create/update/delete.
+async function loadPlans() {
+  let rows = await prisma.plan.findMany({ orderBy: { sortOrder: 'asc' } })
+  if (!rows.length) {
+    await prisma.plan.createMany({ data: DEFAULT_PLANS })
+    rows = await prisma.plan.findMany({ orderBy: { sortOrder: 'asc' } })
   }
-  return out
+  const m = {}
+  for (const r of rows) m[r.id] = normPlan(r)
+  PLAN_CACHE = m
+  return m
 }
 
-function planLimits(plan) {
-  return PLAN_LIMITS[plan] || PLAN_LIMITS.trial
+function planExists(key) {
+  return Boolean(plans()[key])
 }
 
-// Plans a new user may self-serve at signup, with everything the public
-// pricing / comparison page needs: price, limits, allowed channels, and a
-// human feature list. Enterprise is surfaced as a "contact sales" card.
-const SIGNUP_PLAN_ORDER = ['trial', 'monthly', 'yearly', 'enterprise']
-
-function unlimitedOr(n, noun) {
-  return n == null ? `Unlimited ${noun}` : `${n} ${noun}`
+// The plan metadata object (with .label, .monthlyPrice, .durationDays,
+// .billable, .limits, .channels). Falls back to the first plan if unknown.
+function planMeta(key) {
+  const c = plans()
+  return c[key] || c.trial || Object.values(c)[0]
 }
 
-function planChannels(plan) {
-  const out = {}
-  for (const c of ORDER_CHANNELS) out[c] = planAllowsChannel(plan, c)
-  return out
+// All plans as an ordered array (for the platform-admin plan manager).
+function planList() {
+  return Object.values(plans()).sort((a, b) => a.sortOrder - b.sortOrder)
 }
 
-// A display-friendly bullet list of what a plan includes.
-function planFeatures(plan) {
-  const lim = planLimits(plan)
-  const ch = planChannels(plan)
-  const channelLabels = { table: 'Dine-in (tables)', room: 'Room service', takeaway: 'Takeaway' }
-  const channels = ORDER_CHANNELS.filter((c) => ch[c]).map((c) => channelLabels[c])
-  return [
-    unlimitedOr(lim.tables, 'tables'),
-    unlimitedOr(lim.rooms, 'rooms'),
-    unlimitedOr(lim.users, 'staff accounts'),
-    unlimitedOr(lim.dishes, 'menu items'),
-    `Ordering: ${channels.join(', ')}`,
-    'Live orders, kitchen & cashier consoles',
-    'Reports, loyalty & expenses',
-  ]
+function planLimits(key) {
+  return planMeta(key).limits
 }
 
-function publicPlans() {
-  return SIGNUP_PLAN_ORDER.map((key) => {
-    const meta = planMeta(key)
-    const contactSales = key === 'enterprise'
-    return {
-      key,
-      label: meta.label,
-      price: contactSales ? null : meta.monthlyPrice,
-      billable: meta.billable,
-      durationDays: meta.durationDays,
-      // How the price reads on the card.
-      priceNote:
-        key === 'trial'
-          ? `Free for ${meta.durationDays} days`
-          : key === 'yearly'
-            ? 'per month, billed yearly'
-            : key === 'monthly'
-              ? 'per month'
-              : 'Custom pricing',
-      contactSales,
-      selfServe: !contactSales,
-      recommended: key === 'yearly',
-      limits: planLimits(key),
-      channels: planChannels(key),
-      features: planFeatures(key),
-    }
-  })
-}
-
-// Returns { tables, users, dishes } — each value is a positive Int OR null
-// (unlimited). Tenant overrides win; otherwise the plan default applies.
+// Returns { tables, rooms, users, dishes } — tenant overrides win, else plan default.
 function effectiveLimits(org) {
   const base = planLimits(org?.subscriptionPlan)
   return {
@@ -132,8 +109,26 @@ function effectiveLimits(org) {
   }
 }
 
-// Throws an HTTP-shaped error when `currentCount` is at/over the limit for
-// `resource`. Callers catch and translate to a 402 response.
+function planAllowsChannel(key, channel) {
+  return Boolean(planMeta(key).channels[channel])
+}
+
+// Returns { table, room, takeaway } — whether the tenant is *allowed* to offer
+// each channel. Per-tenant override wins; otherwise the plan default.
+function effectiveChannels(org) {
+  const ch = planMeta(org?.subscriptionPlan).channels
+  const override = {
+    table: org?.tableOrderingAllowed,
+    room: org?.roomOrderingAllowed,
+    takeaway: org?.takeawayOrderingAllowed,
+  }
+  const out = {}
+  for (const c of ORDER_CHANNELS) {
+    out[c] = override[c] == null ? Boolean(ch[c]) : Boolean(override[c])
+  }
+  return out
+}
+
 class PlanLimitError extends Error {
   constructor(resource, limit) {
     super(`Plan limit reached for ${resource} (${limit}).`)
@@ -145,57 +140,39 @@ class PlanLimitError extends Error {
 }
 
 function assertWithinLimit(org, resource, currentCount) {
-  const limits = effectiveLimits(org)
-  const cap = limits[resource]
+  const cap = effectiveLimits(org)[resource]
   if (cap == null) return // unlimited
   if (currentCount >= cap) throw new PlanLimitError(resource, cap)
-}
-
-function planMeta(plan) {
-  return PLANS[plan] || PLANS.trial
 }
 
 function addDays(date, days) {
   return new Date(date.getTime() + days * DAY_MS)
 }
 
-// Returns the dates that should be stamped on the org when its plan changes
-// (or when it's first created). Caller still decides which fields to PATCH.
-function periodDatesFor(plan, from = new Date()) {
-  const meta = planMeta(plan)
-  if (plan === 'trial') {
-    return {
-      trialEndsAt: addDays(from, meta.durationDays),
-      currentPeriodStart: null,
-      currentPeriodEnd: null,
-    }
+// Dates to stamp on the org when its plan changes / it's created.
+function periodDatesFor(key, from = new Date()) {
+  const p = planMeta(key)
+  if (p.isTrial) {
+    return { trialEndsAt: addDays(from, p.durationDays || 14), currentPeriodStart: null, currentPeriodEnd: null }
   }
-  if (plan === 'enterprise') {
-    // Enterprise: no auto-expiry. We still stamp a period start for audit.
-    return {
-      trialEndsAt: null,
-      currentPeriodStart: from,
-      currentPeriodEnd: null,
-    }
+  if (p.durationDays == null) {
+    // No-expiry (enterprise-style): stamp a start for audit, no end.
+    return { trialEndsAt: null, currentPeriodStart: from, currentPeriodEnd: null }
   }
-  return {
-    trialEndsAt: null,
-    currentPeriodStart: from,
-    currentPeriodEnd: addDays(from, meta.durationDays),
-  }
+  return { trialEndsAt: null, currentPeriodStart: from, currentPeriodEnd: addDays(from, p.durationDays) }
 }
 
-// Effective status — what the UI / login should treat as the truth.
-// `org` is a row from prisma.organization.findX(). Returns one of:
-//   trial | active | expiring | past_due | expired | cancelled
+// Effective status — trial | active | expiring | past_due | expired | cancelled.
 function effectiveStatus(org, now = new Date()) {
   if (!org) return 'expired'
   if (org.subscriptionStatus === 'cancelled' && !org.currentPeriodEnd) return 'cancelled'
 
-  const plan = org.subscriptionPlan
-  if (plan === 'enterprise') return 'active'
+  const p = planMeta(org.subscriptionPlan)
 
-  if (plan === 'trial') {
+  // No-expiry, non-trial plan (enterprise-style) is always active.
+  if (!p.isTrial && p.durationDays == null) return 'active'
+
+  if (p.isTrial) {
     if (!org.trialEndsAt) return 'trial'
     const ms = new Date(org.trialEndsAt) - now
     if (ms <= 0) return 'expired'
@@ -206,32 +183,30 @@ function effectiveStatus(org, now = new Date()) {
   // Paid plans
   if (!org.currentPeriodEnd) return org.subscriptionStatus || 'active'
   const ms = new Date(org.currentPeriodEnd) - now
-  if (ms <= 0) {
-    return org.cancelAtPeriodEnd ? 'cancelled' : 'past_due'
-  }
+  if (ms <= 0) return org.cancelAtPeriodEnd ? 'cancelled' : 'past_due'
   if (ms <= 5 * DAY_MS) return 'expiring'
   return 'active'
 }
 
 function daysUntilRenewal(org, now = new Date()) {
-  const ref = org?.subscriptionPlan === 'trial' ? org.trialEndsAt : org?.currentPeriodEnd
+  const ref = planMeta(org?.subscriptionPlan).isTrial ? org?.trialEndsAt : org?.currentPeriodEnd
   if (!ref) return null
   const ms = new Date(ref) - now
   return Math.ceil(ms / DAY_MS)
 }
 
-// Status values that should hard-block tenant sign-in.
 function isAccessBlocked(status) {
   return status === 'expired' || status === 'past_due' || status === 'cancelled'
 }
 
 function billingSummary(org, now = new Date()) {
   const status = effectiveStatus(org, now)
+  const meta = planMeta(org.subscriptionPlan)
   return {
     plan: org.subscriptionPlan,
-    planLabel: planMeta(org.subscriptionPlan).label,
+    planLabel: meta.label,
     status,
-    monthlyPrice: org.monthlyPrice || planMeta(org.subscriptionPlan).monthlyPrice,
+    monthlyPrice: org.monthlyPrice || meta.monthlyPrice,
     trialEndsAt: org.trialEndsAt ? new Date(org.trialEndsAt).toISOString() : null,
     currentPeriodStart: org.currentPeriodStart ? new Date(org.currentPeriodStart).toISOString() : null,
     currentPeriodEnd: org.currentPeriodEnd ? new Date(org.currentPeriodEnd).toISOString() : null,
@@ -241,22 +216,122 @@ function billingSummary(org, now = new Date()) {
   }
 }
 
-// INV-YYYY-NNNN — sequential per year. Caller passes the current count for year.
+// ── Public pricing page ───────────────────────────────────────────────
+function unlimitedOr(n, noun) {
+  return n == null ? `Unlimited ${noun}` : `${n} ${noun}`
+}
+
+function planFeatures(p) {
+  const channelLabels = { table: 'Dine-in (tables)', room: 'Room service', takeaway: 'Takeaway' }
+  const channels = ORDER_CHANNELS.filter((c) => p.channels[c]).map((c) => channelLabels[c])
+  return [
+    unlimitedOr(p.limits.tables, 'tables'),
+    unlimitedOr(p.limits.rooms, 'rooms'),
+    unlimitedOr(p.limits.users, 'staff accounts'),
+    unlimitedOr(p.limits.dishes, 'menu items'),
+    `Ordering: ${channels.join(', ') || '—'}`,
+    'Live orders, kitchen & cashier consoles',
+    'Reports, loyalty & expenses',
+  ]
+}
+
+function priceNoteFor(p) {
+  if (p.contactSales) return 'Custom pricing'
+  if (!p.billable) return p.durationDays ? `Free for ${p.durationDays} days` : 'Free'
+  if (p.durationDays === 365) return 'per month, billed yearly'
+  if (p.durationDays === 30) return 'per month'
+  return `every ${p.durationDays} days`
+}
+
+// Plans a visitor can compare & subscribe to on the public signup page.
+function publicPlans() {
+  return planList()
+    .filter((p) => p.active && (p.selfServe || p.contactSales))
+    .map((p) => ({
+      key: p.id,
+      label: p.label,
+      price: p.contactSales ? null : p.monthlyPrice,
+      billable: p.billable,
+      durationDays: p.durationDays,
+      priceNote: priceNoteFor(p),
+      contactSales: p.contactSales,
+      selfServe: p.selfServe,
+      recommended: p.recommended,
+      limits: p.limits,
+      channels: p.channels,
+      features: planFeatures(p),
+    }))
+}
+
+// Map an in-memory plan back to a Plan-model row payload (for create/update).
+function planToRow(p) {
+  return {
+    id: p.id,
+    label: p.label,
+    monthlyPrice: p.monthlyPrice || 0,
+    durationDays: p.durationDays == null ? null : p.durationDays,
+    billable: !!p.billable,
+    isTrial: !!p.isTrial,
+    maxTables: p.limits?.tables == null ? null : p.limits.tables,
+    maxRooms: p.limits?.rooms == null ? null : p.limits.rooms,
+    maxUsers: p.limits?.users == null ? null : p.limits.users,
+    maxDishes: p.limits?.dishes == null ? null : p.limits.dishes,
+    channelTable: p.channels?.table !== false,
+    channelRoom: !!p.channels?.room,
+    channelTakeaway: !!p.channels?.takeaway,
+    contactSales: !!p.contactSales,
+    recommended: !!p.recommended,
+    selfServe: p.selfServe !== false,
+    sortOrder: p.sortOrder || 0,
+    active: p.active !== false,
+  }
+}
+
+// ── Coupons ───────────────────────────────────────────────────────────
+// Compute the discount a coupon applies to `amount` (INR). Returns the
+// discount amount (>=0, capped at amount).
+function couponDiscount(coupon, amount) {
+  if (!coupon || !amount) return 0
+  if (coupon.discountType === 'flat') {
+    return Math.max(0, Math.min(amount, coupon.discountValue || 0))
+  }
+  const pct = Math.max(0, Math.min(100, coupon.discountValue || 0))
+  return Math.min(amount, Math.round((amount * pct) / 100))
+}
+
+// Validate a coupon against a plan. Returns { ok, reason }.
+function couponUsable(coupon, planId, now = new Date()) {
+  if (!coupon || !coupon.active) return { ok: false, reason: 'This coupon is not valid.' }
+  if (coupon.expiresAt && new Date(coupon.expiresAt) < now) return { ok: false, reason: 'This coupon has expired.' }
+  if (coupon.maxRedemptions != null && coupon.redemptions >= coupon.maxRedemptions) {
+    return { ok: false, reason: 'This coupon has reached its redemption limit.' }
+  }
+  const scope = String(coupon.appliesToPlans || '').split(',').map((s) => s.trim()).filter(Boolean)
+  if (scope.length && planId && !scope.includes(planId)) {
+    return { ok: false, reason: "This coupon doesn't apply to the selected plan." }
+  }
+  return { ok: true }
+}
+
 function formatInvoiceNumber(year, sequence) {
   return `INV-${year}-${String(sequence).padStart(4, '0')}`
 }
 
 module.exports = {
-  PLANS,
-  PLAN_LIMITS,
+  DEFAULT_PLANS,
   LIMIT_RESOURCES,
   ORDER_CHANNELS,
+  loadPlans,
+  plans,
+  planList,
+  planExists,
+  planMeta,
+  planLimits,
+  planToRow,
+  effectiveLimits,
   planAllowsChannel,
   effectiveChannels,
   publicPlans,
-  planMeta,
-  planLimits,
-  effectiveLimits,
   assertWithinLimit,
   PlanLimitError,
   periodDatesFor,
@@ -264,6 +339,8 @@ module.exports = {
   daysUntilRenewal,
   isAccessBlocked,
   billingSummary,
+  couponDiscount,
+  couponUsable,
   formatInvoiceNumber,
   addDays,
   DAY_MS,
