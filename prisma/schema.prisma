@@ -232,6 +232,10 @@ model Order {
   // no physical location, so it holds a short generated pickup token.
   tableNo           String
   serviceType       String      @default("table") // "table" | "room" | "takeaway"
+  // Human-facing daily order number. Resets to 1 each day per organization
+  // (in the org's local timezone). Nullable for orders created before this
+  // feature; the API falls back to a short id slice when absent.
+  orderNumber       Int?
   sessionId         String?
   paymentMethod     String      @default("counter")
   paymentStatus     String      @default("pending")
@@ -259,6 +263,19 @@ model Order {
 
   @@index([organizationId])
   @@index([loyaltyPhone])
+}
+
+// One row per (organization, day) holding the last order number handed out
+// that day. Incremented atomically when an order is created so each tenant's
+// order numbers run 1, 2, 3 … and reset the next day.
+model DailyOrderCounter {
+  id             Int      @id @default(autoincrement())
+  organizationId String
+  dayKey         String   // YYYY-MM-DD in the org's local timezone
+  value          Int      @default(0)
+  updatedAt      DateTime @updatedAt
+
+  @@unique([organizationId, dayKey])
 }
 
 model OrderItem {

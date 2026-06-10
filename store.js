@@ -5,6 +5,27 @@ const settings = require('./settings')
 
 const STATUS_FLOW = ['received', 'queued', 'preparing', 'cooking', 'ready', 'served']
 
+// The calendar day (YYYY-MM-DD) in the restaurant's local timezone. Used to
+// key the per-day order counter so numbers reset at local midnight, not UTC.
+function dayKeyFor(date, timeZone) {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: timeZone || 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(date)
+  } catch {
+    // Bad/unknown timezone string — fall back to IST so we still get a number.
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(date)
+  }
+}
+
 // Every order create/list/lookup is org-scoped. `organizationId` is taken from
 // the customer's QR-scan context (URL or `x-organization-id` header) for
 // public flows, and from the JWT-authenticated user for admin flows.
@@ -57,13 +78,16 @@ async function createOrder(payload) {
   // forge a low GST amount. Falls back to the client value only if the org
   // row is missing for some reason.
   let taxRate = 5
+  let orgTimezone = 'Asia/Kolkata'
   if (organizationId) {
     const org = await prisma.organization.findUnique({
       where: { id: organizationId },
-      select: { gstRate: true },
+      select: { gstRate: true, timezone: true },
     })
     if (org && Number.isFinite(org.gstRate)) taxRate = org.gstRate
+    if (org?.timezone) orgTimezone = org.timezone
   }
+  const dayKey = dayKeyFor(new Date(), orgTimezone)
   const tax = Math.round(subtotal * (taxRate / 100))
   const requestedRedeem = Math.max(0, Number(payload.loyalty?.redeem) || 0)
   const redemption = requestedRedeem
@@ -105,12 +129,21 @@ async function createOrder(payload) {
         organizationId,
       })
     }
+    // Daily order number: atomically bump the (org, day) counter. The unique
+    // constraint serializes concurrent creates so no two orders share a number.
+    const counter = await tx.dailyOrderCounter.upsert({
+      where: { organizationId_dayKey: { organizationId, dayKey } },
+      create: { organizationId, dayKey, value: 1 },
+      update: { value: { increment: 1 } },
+    })
+    const orderNumber = counter.value
     return tx.order.create({
       data: {
         id,
         organizationId,
         tableNo,
         serviceType,
+        orderNumber,
         sessionId: payload.sessionId || null,
         paymentMethod: payload.payment?.method || 'counter',
         paymentStatus: 'pending',

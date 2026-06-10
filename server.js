@@ -961,6 +961,7 @@ api.get('/admin/overview', requirePerm('dashboard.view'), asyncRoute(async (req,
     popular,
     recent: orders.slice(0, 8).map((o) => ({
       id: o.id,
+      orderNumber: o.orderNumber ?? null,
       tableNo: o.tableNo,
       status: o.status,
       total: o.amounts?.total,
@@ -992,7 +993,7 @@ api.patch('/admin/orders/:id/status', requirePerm('orders.update'), asyncRoute(a
     action: 'status_change',
     entity: 'order',
     entityId: updated.id,
-    summary: `Order #${updated.id.slice(-6).toUpperCase()} → ${status} (T${updated.tableNo})`,
+    summary: `Order #${updated.orderNumber ?? updated.id.slice(-6).toUpperCase()} → ${status} (T${updated.tableNo})`,
     metadata: { status, tableNo: updated.tableNo },
   })
   res.json(updated)
@@ -1829,7 +1830,9 @@ api.get('/admin/loyalty/:phone/history', requirePerm('loyalty.view'), asyncRoute
     },
     orders: orders.map((o) => ({
       id: o.id,
+      orderNumber: o.orderNumber ?? null,
       tableNo: o.tableNo,
+      serviceType: o.serviceType || 'table',
       total: o.total,
       pointsEarned: o.pointsEarned,
       pointsRedeemed: o.pointsRedeemed,

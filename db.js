@@ -8,6 +8,7 @@ function toApiOrder(o) {
   if (!o) return null
   return {
     id: o.id,
+    orderNumber: o.orderNumber ?? null,
     tableNo: o.tableNo,
     serviceType: o.serviceType || 'table',
     sessionId: o.sessionId,
