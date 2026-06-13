@@ -63,6 +63,15 @@ model Organization {
   tableOrderingEnabled    Boolean @default(true)
   roomOrderingEnabled     Boolean @default(false)
   takeawayOrderingEnabled Boolean @default(false)
+  // Which payment methods the restaurant offers customers. Toggled by the
+  // tenant admin from Settings. `payQrEnabled` only takes effect when a
+  // paymentQrUrl is uploaded. `payLaterEnabled` lets a guest send the order to
+  // the kitchen now and settle the bill afterwards (stays "pending payment").
+  payCashEnabled  Boolean @default(true)
+  payUpiEnabled   Boolean @default(true)
+  payCardEnabled  Boolean @default(true)
+  payQrEnabled    Boolean @default(true)
+  payLaterEnabled Boolean @default(false)
   // Operational settings — applied to every order/receipt/dashboard for this
   // tenant. `gstRate` is a percentage (5 = 5%). `businessHours` is a JSON
   // array string of weekly slots e.g. [{ day: "mon", open: "10:00", close: "23:00" }].
@@ -236,6 +245,10 @@ model Order {
   // (in the org's local timezone). Nullable for orders created before this
   // feature; the API falls back to a short id slice when absent.
   orderNumber       Int?
+  // "Pay Later": the guest chose to settle after the meal. The order skips the
+  // pay-first kitchen gate (it cooks immediately) but stays paymentStatus
+  // "pending" until the cashier records payment.
+  payLater          Boolean     @default(false)
   sessionId         String?
   paymentMethod     String      @default("counter")
   paymentStatus     String      @default("pending")

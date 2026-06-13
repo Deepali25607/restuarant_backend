@@ -22,6 +22,7 @@ function toApiOrder(o) {
     payment: {
       method: o.paymentMethod,
       status: o.paymentStatus,
+      payLater: o.payLater === true,
       paidAt: o.paymentPaidAt ? o.paymentPaidAt.toISOString() : undefined,
       amountPaid: o.paymentAmountPaid ?? undefined,
       claimedAt: o.paymentClaimedAt ? o.paymentClaimedAt.toISOString() : undefined,

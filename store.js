@@ -147,6 +147,9 @@ async function createOrder(payload) {
         sessionId: payload.sessionId || null,
         paymentMethod: payload.payment?.method || 'counter',
         paymentStatus: 'pending',
+        // Pay-later orders cook before payment; everyone else waits for the
+        // cashier to confirm payment before the kitchen can advance them.
+        payLater: payload.payment?.method === 'later',
         subtotal,
         tax,
         tip: payload.amounts?.tip || 0,
@@ -222,7 +225,8 @@ async function setOrderStatus(id, status, { organizationId } = {}) {
   if (organizationId && existing.organizationId !== organizationId) return null
   // Payment gate: an order stays at 'received' until the cashier confirms
   // payment. Only then can the kitchen push it forward (queued → … → served).
-  if (status !== 'received' && existing.paymentStatus !== 'paid') {
+  // Pay-later orders are the explicit exception — they cook while still unpaid.
+  if (status !== 'received' && existing.paymentStatus !== 'paid' && !existing.payLater) {
     const err = new Error('Confirm payment at the Cashier desk before sending this order to the kitchen')
     err.status = 409
     err.code = 'payment_required'
@@ -353,8 +357,9 @@ async function scheduleOrderProgress(order) {
       if (!fresh.autoProgress) return
       const current = await prisma.order.findUnique({ where: { id: order.id } })
       if (!current) return
-      // Respect the payment gate — don't auto-advance an unpaid order.
-      if (current.paymentStatus !== 'paid') return
+      // Respect the payment gate — don't auto-advance an unpaid order, unless
+      // it's a pay-later order (which is allowed to cook before payment).
+      if (current.paymentStatus !== 'paid' && !current.payLater) return
       const curIdx = STATUS_FLOW.indexOf(current.status)
       if (curIdx >= i + 1) return
       try {
@@ -364,6 +369,35 @@ async function scheduleOrderProgress(order) {
       }
     }, stepMs * (i + 1))
   })
+}
+
+// Cashier action: defer payment on an order. Flips it to pay-later so it can
+// be sent to the kitchen now, nudges it off 'received' into the kitchen queue,
+// and leaves paymentStatus 'pending' so the bill stays open until the cashier
+// settles it. No-op once an order is already paid.
+async function markPayLater(id, { organizationId } = {}) {
+  const existing = await prisma.order.findUnique({ where: { id } })
+  if (!existing) return null
+  if (organizationId && existing.organizationId !== organizationId) return null
+  if (existing.paymentStatus === 'paid') {
+    const fresh = await prisma.order.findUnique({
+      where: { id },
+      include: { items: true, rating: true },
+    })
+    return toApiOrder(fresh)
+  }
+  // Push it into the kitchen queue if it's still sitting at 'received'.
+  const nextStatus = existing.status === 'received' ? 'queued' : existing.status
+  const updated = await prisma.order.update({
+    where: { id },
+    data: { payLater: true, status: nextStatus },
+    include: { items: true, rating: true },
+  })
+  const api = toApiOrder(updated)
+  realtime.emitOrderUpdate(api)
+  // Kick off auto-progress (no-op when disabled) now that the gate is lifted.
+  scheduleOrderProgress(api)
+  return api
 }
 
 async function resumePendingOrders() {
@@ -391,6 +425,7 @@ module.exports = {
   setOrderStatus,
   setPaymentMethod,
   markPaid,
+  markPayLater,
   saveRating,
   resumePendingOrders,
   prisma,

@@ -15,6 +15,7 @@ const {
   setOrderStatus,
   setPaymentMethod,
   markPaid,
+  markPayLater,
   saveRating,
   resumePendingOrders,
   prisma,
@@ -73,6 +74,23 @@ function safeParseHours(raw) {
 // parse businessHours from the JSON column, and add the derived
 // subscription/limits/usage shape where useful. Keeps every endpoint that
 // returns an org consistent.
+// Effective customer-facing payment methods for an org. QR only counts when a
+// QR image has actually been uploaded. Used by the customer branding payload
+// (to show/hide options) and the order endpoint (to reject disabled methods).
+function paymentMethodsFor(org) {
+  return {
+    cash: org.payCashEnabled !== false,
+    upi: org.payUpiEnabled !== false,
+    card: org.payCardEnabled !== false,
+    qr: org.payQrEnabled !== false && Boolean(org.paymentQrUrl),
+    later: org.payLaterEnabled === true,
+  }
+}
+
+// Customer-chosen order method → the flag that governs it. 'razorpay' rides on
+// the same online rails as upi/card and is always allowed when either is.
+const ORDER_METHOD_FLAG = { counter: 'cash', cash: 'cash', upi: 'upi', card: 'card', qr: 'qr', later: 'later' }
+
 function shapeOrgForApi(org, extras = {}) {
   return {
     ...org,
@@ -639,6 +657,8 @@ api.get('/organizations/:slugOrId/branding', asyncRoute(async (req, res) => {
     tableOrderingEnabled: allowed.table && org.tableOrderingEnabled,
     roomOrderingEnabled: allowed.room && org.roomOrderingEnabled,
     takeawayOrderingEnabled: allowed.takeaway && org.takeawayOrderingEnabled,
+    // Which payment methods to surface in the customer checkout.
+    paymentMethods: paymentMethodsFor(org),
   })
 }))
 
@@ -829,6 +849,21 @@ api.post('/orders', asyncRoute(async (req, res) => {
     return res.status(403).json({ code: 'channel_disabled', message: `${niceName} is not available here.` })
   }
 
+  // Payment-method gate: refuse an order whose chosen method the restaurant has
+  // switched off (e.g. a stale client trying to "Pay Later" after it was
+  // disabled). Methods are settled later by the cashier regardless.
+  const chosenMethod = payment?.method
+  if (chosenMethod) {
+    const methods = paymentMethodsFor(org)
+    const flag = ORDER_METHOD_FLAG[chosenMethod]
+    if (flag && methods[flag] === false) {
+      return res.status(403).json({
+        code: 'payment_method_disabled',
+        message: 'That payment method is not available here. Please pick another.',
+      })
+    }
+  }
+
   const label = serviceType === 'room' ? 'Room' : 'Table'
 
   // Busy guard: refuse to take an order on a table/room that another customer
@@ -1010,6 +1045,10 @@ const ORG_SETTINGS_FIELDS = [
 ]
 
 const ORG_SETTINGS_BOOL_FIELDS = ['tableOrderingEnabled', 'roomOrderingEnabled', 'takeawayOrderingEnabled']
+// Payment-method toggles — plain tenant preferences (no plan gating).
+const ORG_PAYMENT_BOOL_FIELDS = [
+  'payCashEnabled', 'payUpiEnabled', 'payCardEnabled', 'payQrEnabled', 'payLaterEnabled',
+]
 
 function orgSettingsView(org) {
   return {
@@ -1026,6 +1065,11 @@ function orgSettingsView(org) {
     tableOrderingEnabled: org.tableOrderingEnabled,
     roomOrderingEnabled: org.roomOrderingEnabled,
     takeawayOrderingEnabled: org.takeawayOrderingEnabled,
+    payCashEnabled: org.payCashEnabled !== false,
+    payUpiEnabled: org.payUpiEnabled !== false,
+    payCardEnabled: org.payCardEnabled !== false,
+    payQrEnabled: org.payQrEnabled !== false,
+    payLaterEnabled: org.payLaterEnabled === true,
     // Which channels the plan/platform allows. The tenant's settings UI hides
     // toggles for channels that aren't allowed, and the PATCH below refuses to
     // enable one. The platform admin controls this from the super-admin console.
@@ -1060,6 +1104,9 @@ api.patch('/admin/organization', requirePerm('settings.manage'), asyncRoute(asyn
       })
     }
     data[key] = Boolean(b[key])
+  }
+  for (const key of ORG_PAYMENT_BOOL_FIELDS) {
+    if (key in b) data[key] = Boolean(b[key])
   }
   if (!Object.keys(data).length) {
     return res.status(400).json({ message: 'No editable fields supplied' })
@@ -1351,6 +1398,21 @@ api.post('/admin/orders/:id/pay', requirePerm('billing.collect'), asyncRoute(asy
     entityId: order.id,
     summary: `Paid ₹${order.amounts.total} (${order.payment.method.toUpperCase()}) · ${order.serviceType === 'room' ? 'Room' : 'T'}${order.tableNo}`,
     metadata: { method: order.payment.method, total: order.amounts.total, tip: order.amounts.tip || 0 },
+  })
+  res.json(order)
+}))
+
+// Cashier: defer payment — send the order to the kitchen now, keep the bill
+// open (pending) until it's settled later.
+api.post('/admin/orders/:id/pay-later', requirePerm('billing.collect'), asyncRoute(async (req, res) => {
+  const order = await markPayLater(req.params.id, { organizationId: req.user.orgId })
+  if (!order) return res.status(404).json({ message: 'Order not found' })
+  logAudit(req, {
+    action: 'pay-later',
+    entity: 'order',
+    entityId: order.id,
+    summary: `Deferred payment → kitchen · ${order.serviceType === 'room' ? 'Room' : 'T'}${order.tableNo} (#${order.orderNumber ?? order.id.slice(-6)})`,
+    metadata: { total: order.amounts.total },
   })
   res.json(order)
 }))
