@@ -142,7 +142,17 @@ const upload = multer({
 })
 
 const app = express()
-app.use(cors({ exposedHeaders: ['x-organization-id'] }))
+// Behind the Nginx reverse proxy on AWS. Trusting the proxy makes req.protocol
+// honour X-Forwarded-Proto (https) and req.ip reflect the real client, which
+// the upload-URL builder and any rate/audit logic depend on.
+app.set('trust proxy', 1)
+// CORS_ORIGIN lets prod pin the allowed origin (e.g. https://nexussoftlab.com).
+// It's the same origin as the app when served behind the proxy, so requests are
+// effectively same-origin; default `true` reflects the request origin for dev.
+const corsOrigin = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(',').map((s) => s.trim())
+  : true
+app.use(cors({ origin: corsOrigin, exposedHeaders: ['x-organization-id'] }))
 app.use(express.json({ limit: '2mb' }))
 app.use('/uploads', express.static(UPLOAD_DIR, { maxAge: '7d' }))
 
@@ -1356,7 +1366,12 @@ api.post(
     upload.single('image')(req, res, (err) => {
       if (err) return res.status(400).json({ message: err.message })
       if (!req.file) return res.status(400).json({ message: 'No file uploaded' })
-      const host = `${req.protocol}://${req.get('host')}`
+      // PUBLIC_URL is the app's externally-visible base including the sub-path
+      // (e.g. https://nexussoftlab.com/OrderNow). Without it — local dev — fall
+      // back to the request host so uploaded image URLs stay absolute + correct.
+      const host = process.env.PUBLIC_URL
+        ? process.env.PUBLIC_URL.replace(/\/$/, '')
+        : `${req.protocol}://${req.get('host')}`
       res.status(201).json({
         url: `${host}/uploads/${req.file.filename}`,
         filename: req.file.filename,
@@ -2654,7 +2669,13 @@ app.use((err, req, res, next) => {
 })
 
 const server = http.createServer(app)
-const io = new Server(server, { cors: { origin: '*' } })
+// SOCKET_PATH matches the reverse-proxy route. Behind the /OrderNow proxy it's
+// "/OrderNow/socket.io" (Nginx forwards it verbatim, no rewrite); locally it
+// defaults to "/socket.io". The frontend derives the same value from its API URL.
+const io = new Server(server, {
+  path: process.env.SOCKET_PATH || '/socket.io',
+  cors: { origin: corsOrigin },
+})
 realtime.attach(io)
 
 const PORT = process.env.PORT || 5050
