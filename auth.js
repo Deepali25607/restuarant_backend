@@ -119,4 +119,16 @@ function requireAuth() {
   }
 }
 
-module.exports = { login, requireAuth, sign, publicUser, defaultsForRole }
+// Best-effort JWT verification for endpoints that behave differently for
+// signed-in users but stay public (e.g. /ai/status). Returns the payload or
+// null — never throws.
+function verifyToken(token) {
+  if (!token) return null
+  try {
+    return jwt.verify(token, JWT_SECRET)
+  } catch {
+    return null
+  }
+}
+
+module.exports = { login, requireAuth, sign, publicUser, defaultsForRole, verifyToken }

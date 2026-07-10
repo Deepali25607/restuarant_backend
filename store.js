@@ -74,9 +74,10 @@ async function createOrder(payload) {
   })
 
   const subtotal = payload.amounts?.subtotal || 0
-  // Authoritative tax: recompute from the org's gstRate so a client can't
-  // forge a low GST amount. Falls back to the client value only if the org
-  // row is missing for some reason.
+  // Authoritative tax: recompute server-side so a client can't forge a low
+  // GST amount. Each item is taxed at its dish's own gstRate when one is set,
+  // falling back to the organization's default rate — using the dish price
+  // from the DB, not the client-supplied one.
   let taxRate = 5
   let orgTimezone = 'Asia/Kolkata'
   if (organizationId) {
@@ -88,7 +89,15 @@ async function createOrder(payload) {
     if (org?.timezone) orgTimezone = org.timezone
   }
   const dayKey = dayKeyFor(new Date(), orgTimezone)
-  const tax = Math.round(subtotal * (taxRate / 100))
+  const tax = Math.round(
+    payload.items.reduce((sum, it) => {
+      const dish = dishById.get(String(it.dishId))
+      const rate = Number.isFinite(dish?.gstRate) ? dish.gstRate : taxRate
+      const price = Number.isFinite(dish?.price) ? dish.price : Number(it.price) || 0
+      const qty = Math.max(1, Number(it.qty) || 1)
+      return sum + price * qty * (rate / 100)
+    }, 0),
+  )
   const requestedRedeem = Math.max(0, Number(payload.loyalty?.redeem) || 0)
   const redemption = requestedRedeem
     ? await loyalty.validateRedemption({

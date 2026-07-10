@@ -60,6 +60,9 @@ model Organization {
   tableOrderingAllowed    Boolean?
   roomOrderingAllowed     Boolean?
   takeawayOrderingAllowed Boolean?
+  // AI entitlement override (premium feature). NULL = follow the plan's
+  // aiEnabled default; true/false pinned per tenant by the super-admin.
+  aiAllowed               Boolean?
   tableOrderingEnabled    Boolean @default(true)
   roomOrderingEnabled     Boolean @default(false)
   takeawayOrderingEnabled Boolean @default(false)
@@ -107,6 +110,9 @@ model Plan {
   channelTable    Boolean  @default(true)
   channelRoom     Boolean  @default(false)
   channelTakeaway Boolean  @default(false)
+  // Premium AI features (waiter chatbot, insights, review summaries, menu
+  // descriptions). Off by default — the platform admin enables it per plan.
+  aiEnabled       Boolean  @default(false)
   // Public signup presentation.
   contactSales    Boolean  @default(false) // "Contact us" instead of instant checkout
   recommended     Boolean  @default(false)
@@ -199,6 +205,9 @@ model Dish {
   image          String   @default("")
   isVeg          Boolean  @default(true)
   spice          Int      @default(0)
+  // Per-dish GST override (percentage, e.g. 5 or 12). NULL = use the
+  // organization's default gstRate. Order tax is computed per item from this.
+  gstRate        Float?
   available      Boolean  @default(true)
   tag            String?
   trackStock     Boolean  @default(false)

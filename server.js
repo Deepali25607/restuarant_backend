@@ -20,7 +20,7 @@ const {
   resumePendingOrders,
   prisma,
 } = require('./store')
-const { login, requireAuth, sign, publicUser } = require('./auth')
+const { login, requireAuth, sign, publicUser, verifyToken } = require('./auth')
 const {
   PERMISSIONS,
   ALL_PERMISSIONS,
@@ -36,6 +36,8 @@ const payments = require('./payments')
 const { logAudit } = require('./audit')
 const loyalty = require('./loyalty')
 const platformBranding = require('./platform')
+const ai = require('./ai')
+const insights = require('./insights')
 const {
   loadPlans,
   planList,
@@ -46,6 +48,7 @@ const {
   billingSummary,
   effectiveLimits,
   effectiveChannels,
+  effectiveAi,
   publicPlans,
   couponDiscount,
   couponUsable,
@@ -103,6 +106,7 @@ function shapeOrgForApi(org, extras = {}) {
     // Effective channel entitlements (per-tenant override ?? plan default), so
     // the super-admin console can show what the tenant is currently allowed.
     allowedChannels: effectiveChannels(org),
+    aiEntitled: effectiveAi(org),
     ...extras,
   }
 }
@@ -980,6 +984,211 @@ api.post('/orders/:id/rating', asyncRoute(async (req, res) => {
   res.json(order)
 }))
 
+// ── AI assistant (Gemini) ─────────────────────────────────────────────
+// Customer-facing endpoints are public + org-scoped (same header contract as
+// the menu). Admin endpoints ride the normal permission middleware. All of
+// them 503 with a clear message when GEMINI_API_KEY isn't configured — the
+// frontend hides the AI surfaces in that case.
+
+// AI is a premium entitlement: the platform admin enables it per plan
+// (Plan.aiEnabled) and can pin a per-tenant override (Organization.aiAllowed).
+// Everything AI checks effectiveAi(org) — no entitlement, no AI.
+const AI_NOT_IN_PLAN = {
+  code: 'ai_not_in_plan',
+  message: 'AI features are not included in the current subscription plan.',
+}
+
+// Resolve the org for admin AI endpoints and enforce the entitlement.
+// Responds 403 and returns null when the tenant isn't entitled.
+async function requireAiEntitledOrg(req, res) {
+  const org = req.user?.orgId
+    ? await prisma.organization.findUnique({ where: { id: req.user.orgId } })
+    : null
+  if (!org || !effectiveAi(org)) {
+    res.status(403).json(AI_NOT_IN_PLAN)
+    return null
+  }
+  return org
+}
+
+// Feature discovery for both surfaces: admin consoles resolve their org from
+// the JWT; customer pages send the x-organization-id header. `reason` lets
+// the UI distinguish "no key configured" from "not in this tenant's plan".
+api.get('/ai/status', asyncRoute(async (req, res) => {
+  if (!ai.enabled()) return res.json({ enabled: false, reason: 'not_configured' })
+  const header = req.headers.authorization || ''
+  const payload = verifyToken(header.startsWith('Bearer ') ? header.slice(7) : null)
+  let org = null
+  if (payload?.orgId) {
+    org = await prisma.organization.findUnique({ where: { id: payload.orgId } })
+  }
+  if (!org) {
+    const raw = String(req.headers['x-organization-id'] || '').trim()
+    if (raw) {
+      org = await prisma.organization.findFirst({
+        where: { OR: [{ id: raw }, { slug: raw }], active: true },
+      })
+    }
+  }
+  if (!org) return res.json({ enabled: false, reason: 'no_org' })
+  if (!effectiveAi(org)) return res.json({ enabled: false, reason: 'not_in_plan' })
+  res.json({ enabled: true })
+}))
+
+// The AI Waiter chat: recommendations, diet suggestions (veg/vegan/Jain/
+// high-protein), combos, multilingual replies, cart/order questions.
+// Returns { reply, suggestions } where suggestions are full dish objects the
+// UI renders as add-to-cart cards.
+api.post('/ai/chat', asyncRoute(async (req, res) => {
+  const org = await resolveCustomerOrg(req, res)
+  if (!org) return
+  if (!effectiveAi(org)) return res.status(403).json(AI_NOT_IN_PLAN)
+  ai.checkRateLimit(org.id)
+
+  const { messages, locale, context } = req.body || {}
+  const history = (Array.isArray(messages) ? messages : [])
+    .filter((m) => m && typeof m.text === 'string' && m.text.trim())
+    .slice(-12) // keep the prompt small: last few turns are plenty
+    .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', text: m.text.slice(0, 1000) }))
+  if (!history.length || history[history.length - 1].role !== 'user') {
+    return res.status(400).json({ message: 'messages must end with a user message' })
+  }
+
+  const [dishes, categories] = await Promise.all([
+    prisma.dish.findMany({ where: { organizationId: org.id } }),
+    prisma.category.findMany({ where: { organizationId: org.id }, orderBy: { order: 'asc' } }),
+  ])
+
+  const system = ai.waiterSystemPrompt({ org, dishes, categories, locale, context })
+  const out = await ai.generate({ system, messages: history, json: true, temperature: 0.7 })
+
+  const reply = typeof out.reply === 'string' && out.reply.trim() ? out.reply.trim() : null
+  if (!reply) return res.status(502).json({ message: 'The AI could not answer — please try again.' })
+  const byId = new Map(dishes.map((d) => [d.id, d]))
+  const suggestions = (Array.isArray(out.suggestedDishIds) ? out.suggestedDishIds : [])
+    .map((id) => byId.get(String(id)))
+    .filter((d) => d && d.available && !(d.trackStock && d.stock === 0))
+    .slice(0, 4)
+  res.json({ reply, suggestions })
+}))
+
+// Friendly AI order summary shown on the tracking page, in the guest's language.
+api.get('/ai/order-summary/:orderId', asyncRoute(async (req, res) => {
+  const org = await resolveCustomerOrg(req, res)
+  if (!org) return
+  if (!effectiveAi(org)) return res.status(403).json(AI_NOT_IN_PLAN)
+  const order = await getOrder(req.params.orderId, { organizationId: org.id })
+  if (!order) return res.status(404).json({ message: 'Order not found' })
+  ai.checkRateLimit(org.id)
+  const prompt = ai.orderSummaryPrompt({ order, org, locale: String(req.query.locale || 'en') })
+  const summary = await ai.generate({ messages: [{ role: 'user', text: prompt }], temperature: 0.5, maxOutputTokens: 200 })
+  res.json({ summary })
+}))
+
+// Admin: write an appetising menu description from the dish facts.
+api.post('/ai/describe-dish', requirePerm('menu.manage'), asyncRoute(async (req, res) => {
+  if (!(await requireAiEntitledOrg(req, res))) return
+  const { name, category, isVeg, spice, tag, notes } = req.body || {}
+  if (!name || !String(name).trim()) return res.status(400).json({ message: 'Dish name is required' })
+  ai.checkRateLimit(req.user.orgId)
+  const prompt = ai.dishDescriptionPrompt({
+    name: String(name).slice(0, 120),
+    category: category ? String(category).slice(0, 60) : '',
+    isVeg: isVeg !== false,
+    spice,
+    tag: tag ? String(tag).slice(0, 60) : '',
+    notes: notes ? String(notes).slice(0, 300) : '',
+  })
+  const description = await ai.generate({ messages: [{ role: 'user', text: prompt }], temperature: 0.8, maxOutputTokens: 120 })
+  res.json({ description: description.replace(/^["“]|["”]$/g, '') })
+}))
+
+// Admin: summarise recent customer reviews. Cached per org for 10 minutes so
+// dashboard refreshes don't burn free-tier quota.
+const reviewSummaryCache = new Map() // orgId -> { at, data }
+api.get('/ai/review-summary', requirePerm('dashboard.view'), asyncRoute(async (req, res) => {
+  if (!ai.enabled()) return res.json({ enabled: false })
+  // Silent (non-403) disable so the dashboard card simply doesn't render.
+  const entitledOrg = req.user.orgId
+    ? await prisma.organization.findUnique({ where: { id: req.user.orgId } })
+    : null
+  if (!entitledOrg || !effectiveAi(entitledOrg)) return res.json({ enabled: false })
+  const orgId = req.user.orgId
+  const cached = reviewSummaryCache.get(orgId)
+  if (cached && Date.now() - cached.at < 10 * 60_000) return res.json(cached.data)
+
+  const ratings = await prisma.rating.findMany({
+    where: { order: { organizationId: orgId } },
+    orderBy: { createdAt: 'desc' },
+    take: 100,
+  })
+  if (ratings.length < 3) {
+    return res.json({ enabled: true, count: ratings.length, summary: null })
+  }
+  ai.checkRateLimit(orgId)
+  const out = await ai.generate({
+    messages: [{ role: 'user', text: ai.reviewSummaryPrompt(ratings) }],
+    json: true,
+    temperature: 0.4,
+  })
+  const avg = (key) => Math.round((ratings.reduce((s, r) => s + (r[key] || 0), 0) / ratings.length) * 10) / 10
+  const data = {
+    enabled: true,
+    count: ratings.length,
+    averages: { food: avg('food'), service: avg('service'), overall: avg('overall') },
+    summary: typeof out.summary === 'string' ? out.summary : '',
+    highlights: Array.isArray(out.highlights) ? out.highlights.slice(0, 3) : [],
+    improvements: Array.isArray(out.improvements) ? out.improvements.slice(0, 3) : [],
+    sentiment: ['positive', 'mixed', 'negative'].includes(out.sentiment) ? out.sentiment : 'mixed',
+  }
+  reviewSummaryCache.set(orgId, { at: Date.now(), data })
+  res.json(data)
+}))
+
+// Admin: "Ask your data" — natural-language questions over the org's own
+// pre-aggregated business snapshot (see insights.js for the safety model).
+api.post('/ai/insights', requirePerm('reports.view'), asyncRoute(async (req, res) => {
+  if (!ai.enabled()) {
+    return res.status(503).json({ message: 'AI is not configured. Set GEMINI_API_KEY on the server.' })
+  }
+  if (!(await requireAiEntitledOrg(req, res))) return
+  const { question, history } = req.body || {}
+  const q = String(question || '').trim()
+  if (!q) return res.status(400).json({ message: 'question is required' })
+  ai.checkRateLimit(req.user.orgId)
+
+  const snapshot = await insights.snapshotFor(req.user.orgId)
+  // A little history lets follow-ups ("and compared to last week?") work.
+  const messages = [
+    ...(Array.isArray(history) ? history : [])
+      .filter((m) => m && typeof m.text === 'string' && m.text.trim())
+      .slice(-6)
+      .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', text: m.text.slice(0, 800) })),
+    { role: 'user', text: q.slice(0, 500) },
+  ]
+  const out = await ai.generate({
+    system: insights.analystSystemPrompt(snapshot),
+    messages,
+    json: true,
+    temperature: 0.3,
+    maxOutputTokens: 1500,
+  })
+
+  const table =
+    out.table && Array.isArray(out.table.columns) && Array.isArray(out.table.rows)
+      ? {
+          title: String(out.table.title || ''),
+          columns: out.table.columns.map(String).slice(0, 6),
+          rows: out.table.rows.slice(0, 10).map((r) => (Array.isArray(r) ? r.map(String).slice(0, 6) : [String(r)])),
+        }
+      : null
+  res.json({
+    answer: typeof out.answer === 'string' ? out.answer : 'I could not work that out — please try rephrasing.',
+    table,
+    followups: (Array.isArray(out.followups) ? out.followups : []).map(String).slice(0, 3),
+  })
+}))
+
 // ── Admin: dashboards & orders ────────────────────────────────────────
 api.get('/admin/overview', requirePerm('dashboard.view'), asyncRoute(async (req, res) => {
   const orders = await listOrders({ organizationId: req.user.orgId })
@@ -1072,6 +1281,8 @@ function orgSettingsView(org) {
     gstNumber: org.gstNumber,
     contactPhone: org.contactPhone,
     contactEmail: org.contactEmail,
+    gstRate: org.gstRate,
+    taxLabel: org.taxLabel,
     tableOrderingEnabled: org.tableOrderingEnabled,
     roomOrderingEnabled: org.roomOrderingEnabled,
     takeawayOrderingEnabled: org.takeawayOrderingEnabled,
@@ -1101,6 +1312,12 @@ api.patch('/admin/organization', requirePerm('settings.manage'), asyncRoute(asyn
   for (const key of ORG_SETTINGS_FIELDS) {
     if (key in b) data[key] = String(b[key] ?? '')
   }
+  // Taxes: the restaurant-wide default GST rate (0 = no tax) and the label
+  // printed on bills. Dishes can override the rate individually.
+  if ('gstRate' in b && Number.isFinite(Number(b.gstRate))) {
+    data.gstRate = Math.max(0, Math.min(100, Number(b.gstRate)))
+  }
+  if ('taxLabel' in b) data.taxLabel = String(b.taxLabel || 'GST').slice(0, 20)
   // The tenant can only toggle channels their plan allows; trying to enable a
   // restricted one is refused (the UI hides it, this is the server-side guard).
   const allowed = effectiveChannels(org)
@@ -1249,6 +1466,11 @@ api.post('/admin/menu', requirePerm('menu.manage'), asyncRoute(async (req, res) 
       image: String(d.image || ''),
       isVeg: Boolean(d.isVeg),
       spice: Math.min(3, Math.max(0, Number(d.spice) || 0)),
+      // Empty/absent → null → "use the restaurant's default GST rate".
+      gstRate:
+        d.gstRate === '' || d.gstRate == null
+          ? null
+          : Math.min(100, Math.max(0, Number(d.gstRate) || 0)),
       available: d.available !== false,
       tag: d.tag || null,
       trackStock: Boolean(d.trackStock),
@@ -1281,6 +1503,12 @@ api.patch('/admin/menu/:id', requirePerm('menu.manage'), asyncRoute(async (req, 
   if ('image' in b) data.image = String(b.image)
   if ('isVeg' in b) data.isVeg = Boolean(b.isVeg)
   if ('spice' in b) data.spice = Math.min(3, Math.max(0, Number(b.spice) || 0))
+  if ('gstRate' in b) {
+    data.gstRate =
+      b.gstRate === '' || b.gstRate == null
+        ? null
+        : Math.min(100, Math.max(0, Number(b.gstRate) || 0))
+  }
   if ('available' in b) data.available = Boolean(b.available)
   if ('tag' in b) data.tag = b.tag || null
   if ('trackStock' in b) data.trackStock = Boolean(b.trackStock)
@@ -2281,7 +2509,7 @@ api.patch('/super-admin/organizations/:id', requirePerm('organizations.manage'),
   // channels a tenant is ALLOWED to offer. `null` clears the override and falls
   // back to the plan default; true/false pins it. A revoked channel is hidden
   // from the tenant's own settings and can't be enabled or ordered from.
-  for (const key of ['tableOrderingAllowed', 'roomOrderingAllowed', 'takeawayOrderingAllowed']) {
+  for (const key of ['tableOrderingAllowed', 'roomOrderingAllowed', 'takeawayOrderingAllowed', 'aiAllowed']) {
     if (!(key in b)) continue
     data[key] = b[key] === null ? null : Boolean(b[key])
   }
@@ -2528,6 +2756,7 @@ function planBodyToRow(b, id) {
     channelTable: (b.channels ? b.channels.table : b.channelTable) !== false,
     channelRoom: !!(b.channels ? b.channels.room : b.channelRoom),
     channelTakeaway: !!(b.channels ? b.channels.takeaway : b.channelTakeaway),
+    aiEnabled: !!(b.ai !== undefined ? b.ai : b.aiEnabled),
     contactSales: !!b.contactSales,
     recommended: !!b.recommended,
     selfServe: (b.selfServe === undefined ? true : b.selfServe) !== false,
@@ -2656,6 +2885,9 @@ app.get('/', (req, res) => {
 })
 
 app.use((err, req, res, next) => {
+  if (err instanceof ai.AiError) {
+    return res.status(err.status || 502).json({ message: err.message, code: 'ai_error' })
+  }
   if (err instanceof PlanLimitError) {
     return res.status(402).json({
       message: err.message,

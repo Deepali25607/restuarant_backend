@@ -16,10 +16,10 @@ const ORDER_CHANNELS = ['table', 'room', 'takeaway']
 // Built-in plans. Seeded into the DB on first run and used as a fallback before
 // the cache loads. Field shape matches the Plan model.
 const DEFAULT_PLANS = [
-  { id: 'trial', label: 'Trial', monthlyPrice: 0, durationDays: 14, billable: false, isTrial: true, maxTables: 5, maxRooms: 5, maxUsers: 6, maxDishes: 30, channelTable: true, channelRoom: false, channelTakeaway: false, contactSales: false, recommended: false, selfServe: true, sortOrder: 1, active: true },
-  { id: 'monthly', label: 'Monthly', monthlyPrice: 2999, durationDays: 30, billable: true, isTrial: false, maxTables: 20, maxRooms: 20, maxUsers: 10, maxDishes: 100, channelTable: true, channelRoom: true, channelTakeaway: true, contactSales: false, recommended: false, selfServe: true, sortOrder: 2, active: true },
-  { id: 'yearly', label: 'Yearly', monthlyPrice: 2499, durationDays: 365, billable: true, isTrial: false, maxTables: 30, maxRooms: 30, maxUsers: 15, maxDishes: 200, channelTable: true, channelRoom: true, channelTakeaway: true, contactSales: false, recommended: true, selfServe: true, sortOrder: 3, active: true },
-  { id: 'enterprise', label: 'Enterprise', monthlyPrice: 0, durationDays: null, billable: false, isTrial: false, maxTables: null, maxRooms: null, maxUsers: null, maxDishes: null, channelTable: true, channelRoom: true, channelTakeaway: true, contactSales: true, recommended: false, selfServe: false, sortOrder: 4, active: true },
+  { id: 'trial', label: 'Trial', monthlyPrice: 0, durationDays: 14, billable: false, isTrial: true, maxTables: 5, maxRooms: 5, maxUsers: 6, maxDishes: 30, channelTable: true, channelRoom: false, channelTakeaway: false, aiEnabled: false, contactSales: false, recommended: false, selfServe: true, sortOrder: 1, active: true },
+  { id: 'monthly', label: 'Monthly', monthlyPrice: 2999, durationDays: 30, billable: true, isTrial: false, maxTables: 20, maxRooms: 20, maxUsers: 10, maxDishes: 100, channelTable: true, channelRoom: true, channelTakeaway: true, aiEnabled: false, contactSales: false, recommended: false, selfServe: true, sortOrder: 2, active: true },
+  { id: 'yearly', label: 'Yearly', monthlyPrice: 2499, durationDays: 365, billable: true, isTrial: false, maxTables: 30, maxRooms: 30, maxUsers: 15, maxDishes: 200, channelTable: true, channelRoom: true, channelTakeaway: true, aiEnabled: true, contactSales: false, recommended: true, selfServe: true, sortOrder: 3, active: true },
+  { id: 'enterprise', label: 'Enterprise', monthlyPrice: 0, durationDays: null, billable: false, isTrial: false, maxTables: null, maxRooms: null, maxUsers: null, maxDishes: null, channelTable: true, channelRoom: true, channelTakeaway: true, aiEnabled: true, contactSales: true, recommended: false, selfServe: false, sortOrder: 4, active: true },
 ]
 
 // Normalize a Plan row (DB or default) into the in-memory shape callers use.
@@ -48,6 +48,8 @@ function normPlan(row) {
       room: !!row.channelRoom,
       takeaway: !!row.channelTakeaway,
     },
+    // Premium AI features — plan-level default, per-org override on top.
+    ai: !!row.aiEnabled,
   }
 }
 
@@ -127,6 +129,14 @@ function effectiveChannels(org) {
     out[c] = override[c] == null ? Boolean(ch[c]) : Boolean(override[c])
   }
   return out
+}
+
+// Whether the tenant may use the premium AI features (waiter chatbot,
+// insights, review summaries, menu descriptions). Same rule as channels:
+// per-tenant override wins; NULL falls back to the plan's aiEnabled flag.
+function effectiveAi(org) {
+  if (org?.aiAllowed != null) return Boolean(org.aiAllowed)
+  return Boolean(planMeta(org?.subscriptionPlan).ai)
 }
 
 class PlanLimitError extends Error {
@@ -232,6 +242,7 @@ function planFeatures(p) {
     `Ordering: ${channels.join(', ') || '—'}`,
     'Live orders, kitchen & cashier consoles',
     'Reports, loyalty & expenses',
+    ...(p.ai ? ['✨ AI assistant, waiter chatbot & insights'] : []),
   ]
 }
 
@@ -279,6 +290,7 @@ function planToRow(p) {
     channelTable: p.channels?.table !== false,
     channelRoom: !!p.channels?.room,
     channelTakeaway: !!p.channels?.takeaway,
+    aiEnabled: !!p.ai,
     contactSales: !!p.contactSales,
     recommended: !!p.recommended,
     selfServe: p.selfServe !== false,
@@ -331,6 +343,7 @@ module.exports = {
   effectiveLimits,
   planAllowsChannel,
   effectiveChannels,
+  effectiveAi,
   publicPlans,
   assertWithinLimit,
   PlanLimitError,
