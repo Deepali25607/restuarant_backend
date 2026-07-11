@@ -174,6 +174,9 @@ async function createOrder(payload) {
             dishId: String(it.dishId),
             name: String(it.name),
             price: Number(it.price),
+            // Snapshot the kitchen cost like we snapshot price, so profit
+            // history survives later menu edits. Null = cost not set yet.
+            costPrice: dishById.get(String(it.dishId))?.costPrice ?? null,
             qty: Number(it.qty),
             instructions: String(it.instructions || ''),
           })),

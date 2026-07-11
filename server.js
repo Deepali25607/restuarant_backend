@@ -693,7 +693,8 @@ api.get('/menu', asyncRoute(async (req, res) => {
   const dishes = await prisma.dish.findMany({
     where: { organizationId: org.id },
   })
-  res.json(dishes.map((d) => ({ ...d, tag: d.tag || undefined })))
+  // Public endpoint — never expose what a dish costs the kitchen.
+  res.json(dishes.map(({ costPrice: _cost, ...d }) => ({ ...d, tag: d.tag || undefined })))
 }))
 
 api.get('/tables/:no', asyncRoute(async (req, res) => {
@@ -1442,6 +1443,13 @@ api.delete('/admin/categories/:id', requirePerm('menu.manage'), asyncRoute(async
   res.json(removed)
 }))
 
+// Staff view of the menu — same rows as /menu but WITH costPrice, so the
+// editor can show and preserve each dish's kitchen cost.
+api.get('/admin/menu', requirePerm('menu.manage'), asyncRoute(async (req, res) => {
+  const dishes = await prisma.dish.findMany({ where: orgScope(req) })
+  res.json(dishes.map((d) => ({ ...d, tag: d.tag || undefined })))
+}))
+
 api.post('/admin/menu', requirePerm('menu.manage'), asyncRoute(async (req, res) => {
   const d = req.body || {}
   if (!d.name || !d.categoryId || !d.price) {
@@ -1466,6 +1474,12 @@ api.post('/admin/menu', requirePerm('menu.manage'), asyncRoute(async (req, res) 
       image: String(d.image || ''),
       isVeg: Boolean(d.isVeg),
       spice: Math.min(3, Math.max(0, Number(d.spice) || 0)),
+      // Kitchen cost per portion. Empty/absent → null → "not costed yet";
+      // profit reports skip the dish instead of assuming 100% margin.
+      costPrice:
+        d.costPrice === '' || d.costPrice == null
+          ? null
+          : Math.max(0, Number(d.costPrice) || 0),
       // Empty/absent → null → "use the restaurant's default GST rate".
       gstRate:
         d.gstRate === '' || d.gstRate == null
@@ -1503,6 +1517,12 @@ api.patch('/admin/menu/:id', requirePerm('menu.manage'), asyncRoute(async (req, 
   if ('image' in b) data.image = String(b.image)
   if ('isVeg' in b) data.isVeg = Boolean(b.isVeg)
   if ('spice' in b) data.spice = Math.min(3, Math.max(0, Number(b.spice) || 0))
+  if ('costPrice' in b) {
+    data.costPrice =
+      b.costPrice === '' || b.costPrice == null
+        ? null
+        : Math.max(0, Number(b.costPrice) || 0)
+  }
   if ('gstRate' in b) {
     data.gstRate =
       b.gstRate === '' || b.gstRate == null
@@ -2352,6 +2372,440 @@ api.get('/admin/reports/summary', requirePerm('reports.view'), asyncRoute(async 
         .slice(0, 5)
         .map((r) => ({ comments: r.comments, overall: r.overall, createdAt: r.createdAt.toISOString() })),
     },
+  })
+}))
+
+// Rich analytics behind the redesigned Reports dashboard. One endpoint returns
+// every panel's data for a window plus the previous window of equal length so
+// the UI can show trend deltas. Optional filters narrow the order set:
+//   serviceType=table|room|takeaway   paymentMethod=<method>
+// Time-of-day bucketing uses the organization's timezone (like insights.js),
+// so "dinner rush" means the restaurant's clock, not the server's.
+const tzPart = (date, timeZone, opts) => {
+  try {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: timeZone || 'Asia/Kolkata', ...opts }).format(date)
+  } catch {
+    return null
+  }
+}
+const tzDayKey = (date, tz) => tzPart(date, tz, { year: 'numeric', month: '2-digit', day: '2-digit' }) || date.toISOString().slice(0, 10)
+const tzHour = (date, tz) => {
+  const h = Number(tzPart(date, tz, { hour: 'numeric', hour12: false }))
+  return Number.isFinite(h) ? h % 24 : date.getHours()
+}
+const WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+const tzWeekdayIndex = (date, tz) => {
+  const w = tzPart(date, tz, { weekday: 'short' })
+  const i = WEEKDAYS.findIndex((d) => w && w.startsWith(d))
+  return i >= 0 ? i : (date.getDay() + 6) % 7
+}
+
+api.get('/admin/reports/analytics', requirePerm('reports.view'), asyncRoute(async (req, res) => {
+  const { from, to, serviceType, paymentMethod } = req.query
+  const fromDate = from ? startOfDay(from) : startOfDay(Date.now() - 6 * 86400000)
+  const toDate = to ? new Date(to) : new Date()
+  const windowMs = Math.max(86400000, toDate.getTime() - fromDate.getTime())
+  const prevTo = new Date(fromDate.getTime() - 1)
+  const prevFrom = new Date(fromDate.getTime() - windowMs)
+
+  const orderFilter = {}
+  if (serviceType && ['table', 'room', 'takeaway'].includes(serviceType)) orderFilter.serviceType = serviceType
+  if (paymentMethod) orderFilter.paymentMethod = paymentMethod
+
+  const org = req.user.orgId
+    ? await prisma.organization.findUnique({ where: { id: req.user.orgId } })
+    : null
+  const tz = org?.timezone || 'Asia/Kolkata'
+  const orgGst = org?.gstRate ?? 5
+
+  const [orders, prevOrders, dishes, categories, ratings, expenses, prevExpenses, loyaltyMembers, tables, roomsList] = await Promise.all([
+    prisma.order.findMany({
+      where: { ...orgScope(req), ...orderFilter, createdAt: { gte: fromDate, lte: toDate } },
+      include: { items: true },
+    }),
+    prisma.order.findMany({
+      where: { ...orgScope(req), ...orderFilter, createdAt: { gte: prevFrom, lte: prevTo } },
+      include: { items: true }, // items carry cost snapshots for prev-period COGS
+    }),
+    prisma.dish.findMany({ where: orgScope(req) }),
+    prisma.category.findMany({ where: orgScope(req), orderBy: { order: 'asc' } }),
+    prisma.rating.findMany({
+      where: { createdAt: { gte: fromDate, lte: toDate }, order: orgScope(req) },
+      orderBy: { createdAt: 'desc' },
+    }),
+    prisma.expense.findMany({ where: { ...orgScope(req), date: { gte: fromDate, lte: toDate } } }),
+    prisma.expense.findMany({ where: { ...orgScope(req), date: { gte: prevFrom, lte: prevTo } } }),
+    prisma.loyaltyMember.findMany({ where: orgScope(req) }),
+    prisma.table.findMany({ where: orgScope(req) }),
+    prisma.room.findMany({ where: orgScope(req) }),
+  ])
+
+  const completed = orders.filter((o) => o.status === 'served')
+  const active = orders.filter((o) => o.status !== 'served')
+  const sum = (arr, fn) => arr.reduce((s, x) => s + (fn(x) || 0), 0)
+
+  // ── Headline totals + previous window for deltas ──
+  const revenue = sum(completed, (o) => o.total)
+  const expenseTotal = sum(expenses, (e) => e.amount)
+  const profit = revenue - expenseTotal
+  const distinctPhones = (list) => new Set(list.filter((o) => o.loyaltyPhone).map((o) => o.loyaltyPhone)).size
+  const totals = {
+    revenue,
+    subtotal: sum(completed, (o) => o.subtotal),
+    tax: sum(completed, (o) => o.tax),
+    tips: sum(completed, (o) => o.tip),
+    discounts: sum(completed, (o) => o.discount),
+    orders: orders.length,
+    completedOrders: completed.length,
+    activeOrders: active.length,
+    pendingPaymentOrders: orders.filter((o) => o.paymentStatus !== 'paid').length,
+    pendingPaymentAmount: sum(orders.filter((o) => o.paymentStatus !== 'paid'), (o) => o.total),
+    avgTicket: completed.length ? Math.round(revenue / completed.length) : 0,
+    expenses: expenseTotal,
+    profit,
+    margin: revenue ? Math.round((profit / revenue) * 1000) / 10 : 0,
+    customers: distinctPhones(orders),
+    itemsSold: sum(completed, (o) => sum(o.items, (it) => it.qty)),
+  }
+  const prevCompleted = prevOrders.filter((o) => o.status === 'served')
+  const prevRevenue = sum(prevCompleted, (o) => o.total)
+  const prevExpenseTotal = sum(prevExpenses, (e) => e.amount)
+  const prevTotals = {
+    revenue: prevRevenue,
+    tax: sum(prevCompleted, (o) => o.tax),
+    orders: prevOrders.length,
+    completedOrders: prevCompleted.length,
+    avgTicket: prevCompleted.length ? Math.round(prevRevenue / prevCompleted.length) : 0,
+    expenses: prevExpenseTotal,
+    profit: prevRevenue - prevExpenseTotal,
+    customers: distinctPhones(prevOrders),
+  }
+
+  // ── Series: daily trend, hour-of-day, weekday × hour heatmap ──
+  const dayMap = new Map()
+  for (let t = fromDate.getTime(); t <= toDate.getTime(); t += 86400000) {
+    const key = tzDayKey(new Date(t), tz)
+    if (!dayMap.has(key)) dayMap.set(key, { date: key, revenue: 0, orders: 0, customers: new Set() })
+  }
+  const hourly = Array.from({ length: 24 }, (_, hour) => ({ hour, orders: 0, revenue: 0 }))
+  const heatmap = Array.from({ length: 7 }, () => Array(24).fill(0))
+  completed.forEach((o) => {
+    const row = dayMap.get(tzDayKey(o.createdAt, tz))
+    if (row) {
+      row.revenue += o.total || 0
+      row.orders += 1
+      if (o.loyaltyPhone) row.customers.add(o.loyaltyPhone)
+    }
+    const h = tzHour(o.createdAt, tz)
+    hourly[h].orders += 1
+    hourly[h].revenue += o.total || 0
+    heatmap[tzWeekdayIndex(o.createdAt, tz)][h] += 1
+  })
+  const daily = Array.from(dayMap.values()).map((d) => ({ ...d, customers: d.customers.size }))
+
+  const statusCounts = {}
+  orders.forEach((o) => {
+    statusCounts[o.status] = (statusCounts[o.status] || 0) + 1
+  })
+
+  // ── Dish & category performance (+ per-dish GST and profit) ──
+  const dishById = new Map(dishes.map((d) => [d.id, d]))
+  const catById = new Map(categories.map((c) => [c.id, c]))
+  // Kitchen cost of one unit: prefer the snapshot taken at order time, fall
+  // back to the dish's current costPrice (covers orders placed before
+  // costing existed). Null = unknown — the item is excluded from profit
+  // maths rather than counted as pure margin.
+  const unitCost = (it) => {
+    const c = it.costPrice ?? dishById.get(it.dishId)?.costPrice
+    return Number.isFinite(c) ? c : null
+  }
+  const costStats = (list) => {
+    let cogs = 0
+    let costedValue = 0
+    let totalValue = 0
+    list.forEach((o) =>
+      o.items.forEach((it) => {
+        const gross = it.qty * it.price
+        totalValue += gross
+        const c = unitCost(it)
+        if (c != null) {
+          cogs += c * it.qty
+          costedValue += gross
+        }
+      }),
+    )
+    return { cogs, costedValue, totalValue }
+  }
+  const dishAgg = new Map()
+  const catAgg = new Map()
+  completed.forEach((o) =>
+    o.items.forEach((it) => {
+      const dish = dishById.get(it.dishId)
+      const gross = it.qty * it.price
+      // Apportion the order's *recorded* tax across its items by value, so
+      // per-dish/per-category GST always reconciles with the collected total
+      // regardless of how each dish's rate was configured at order time.
+      const itemTax = o.subtotal > 0 ? Math.round((o.tax * gross) / o.subtotal) : 0
+      const d = dishAgg.get(it.name) || { name: it.name, qty: 0, revenue: 0, gst: 0, category: '', cost: 0, costedQty: 0, costedRevenue: 0 }
+      d.qty += it.qty
+      d.revenue += gross
+      d.gst += itemTax
+      const c = unitCost(it)
+      if (c != null) {
+        d.cost += c * it.qty
+        d.costedQty += it.qty
+        d.costedRevenue += gross
+      }
+      const cat = dish ? catById.get(dish.categoryId) : null
+      d.category = cat?.name || d.category
+      dishAgg.set(it.name, d)
+      const cKey = cat?.name || 'Other'
+      const cRow = catAgg.get(cKey) || { name: cKey, emoji: cat?.emoji || '🍽️', qty: 0, revenue: 0, gst: 0 }
+      cRow.qty += it.qty
+      cRow.revenue += gross
+      cRow.gst += itemTax
+      catAgg.set(cKey, cRow)
+    }),
+  )
+  const allDishStats = Array.from(dishAgg.values())
+  const soldNames = new Set(allDishStats.map((d) => d.name))
+  // Profitability only over the portion of sales whose cost is known —
+  // honest margins, no invented 100%-profit rows.
+  const profitability = allDishStats
+    .filter((d) => d.costedQty > 0)
+    .map((d) => {
+      const profit = d.costedRevenue - d.cost
+      return {
+        name: d.name,
+        category: d.category,
+        qty: d.qty,
+        revenue: d.revenue,
+        cost: d.cost,
+        profit,
+        margin: d.costedRevenue ? Math.round((profit / d.costedRevenue) * 100) : 0,
+      }
+    })
+    .sort((a, b) => b.profit - a.profit)
+  const uncostedSold = allDishStats.filter((d) => d.costedQty === 0).map((d) => d.name)
+  const dishesOut = {
+    top: [...allDishStats].sort((a, b) => b.qty - a.qty).slice(0, 10),
+    byRevenue: [...allDishStats].sort((a, b) => b.revenue - a.revenue).slice(0, 10),
+    slow: [...allDishStats].sort((a, b) => a.qty - b.qty).slice(0, 5),
+    zeroSales: dishes
+      .filter((d) => d.available && !soldNames.has(d.name))
+      .slice(0, 10)
+      .map((d) => ({ name: d.name, category: catById.get(d.categoryId)?.name || '' })),
+    distinctSold: allDishStats.length,
+    profitability: profitability.slice(0, 15),
+    uncostedSold: uncostedSold.slice(0, 15),
+    uncostedCount: uncostedSold.length,
+  }
+  const categoriesOut = Array.from(catAgg.values()).sort((a, b) => b.revenue - a.revenue)
+
+  // ── Real profit: revenue − COGS − expenses ──
+  const cost = costStats(completed)
+  const prevCost = costStats(prevCompleted)
+  totals.cogs = cost.cogs
+  totals.costCoverage = cost.totalValue ? Math.round((cost.costedValue / cost.totalValue) * 100) : 0
+  totals.grossProfit = cost.costedValue - cost.cogs
+  totals.foodCostPct = cost.costedValue ? Math.round((cost.cogs / cost.costedValue) * 1000) / 10 : 0
+  totals.profit = revenue - cost.cogs - expenseTotal
+  totals.margin = revenue ? Math.round((totals.profit / revenue) * 1000) / 10 : 0
+  prevTotals.cogs = prevCost.cogs
+  prevTotals.grossProfit = prevCost.costedValue - prevCost.cogs
+  prevTotals.profit = prevTotals.revenue - prevCost.cogs - prevExpenseTotal
+
+  // ── Settlements (money actually collected, by method) ──
+  const paid = orders.filter((o) => o.paymentStatus === 'paid')
+  const byMethod = {}
+  paid.forEach((o) => {
+    const m = o.paymentMethod || 'counter'
+    byMethod[m] = byMethod[m] || { count: 0, amount: 0 }
+    byMethod[m].count += 1
+    byMethod[m].amount += o.total || 0
+  })
+  const payments = {
+    total: sum(paid, (o) => o.total),
+    count: paid.length,
+    byMethod,
+  }
+
+  // ── Service mix + table / room utilisation ──
+  const mixOf = (svc) => {
+    const list = completed.filter((o) => o.serviceType === svc)
+    return {
+      orders: list.length,
+      revenue: sum(list, (o) => o.total),
+      avgTicket: list.length ? Math.round(sum(list, (o) => o.total) / list.length) : 0,
+    }
+  }
+  const serviceMix = { table: mixOf('table'), room: mixOf('room'), takeaway: mixOf('takeaway') }
+
+  const days = Math.max(1, Math.round(windowMs / 86400000))
+  const locAgg = (svc) => {
+    const m = new Map()
+    completed
+      .filter((o) => o.serviceType === svc)
+      .forEach((o) => {
+        const row = m.get(o.tableNo) || { number: o.tableNo, orders: 0, revenue: 0 }
+        row.orders += 1
+        row.revenue += o.total || 0
+        m.set(o.tableNo, row)
+      })
+    return Array.from(m.values()).sort((a, b) => b.revenue - a.revenue)
+  }
+  const tableStats = locAgg('table')
+  const roomStats = locAgg('room')
+  const tablesOut = {
+    total: tables.length,
+    active: tableStats.length,
+    occupancyRate: tables.length ? Math.round((tableStats.length / tables.length) * 100) : 0,
+    turnoverPerDay: tables.length ? Math.round((serviceMix.table.orders / tables.length / days) * 10) / 10 : 0,
+    list: tableStats,
+  }
+  const roomsOut = {
+    total: roomsList.length,
+    active: roomStats.length,
+    orders: serviceMix.room.orders,
+    revenue: serviceMix.room.revenue,
+    avgBill: serviceMix.room.avgTicket,
+    list: roomStats,
+  }
+
+  // ── Customer analytics (loyalty members + order phone links) ──
+  const now = new Date()
+  const dayAgo = startOfDay(now)
+  const weekAgo = new Date(now.getTime() - 7 * 86400000)
+  const monthAgo = new Date(now.getTime() - 30 * 86400000)
+  const yearAgo = new Date(now.getTime() - 365 * 86400000)
+  const memberByPhone = new Map(loyaltyMembers.map((m) => [m.phone, m]))
+  const windowPhones = new Set(orders.filter((o) => o.loyaltyPhone).map((o) => o.loyaltyPhone))
+  let newInWindow = 0
+  let returningInWindow = 0
+  windowPhones.forEach((p) => {
+    const m = memberByPhone.get(p)
+    if (m && m.joinedAt >= fromDate && m.joinedAt <= toDate) newInWindow += 1
+    else returningInWindow += 1
+  })
+  const freqBucket = { once: 0, casual: 0, regular: 0, loyal: 0 }
+  loyaltyMembers.forEach((m) => {
+    if (m.visits >= 10) freqBucket.loyal += 1
+    else if (m.visits >= 5) freqBucket.regular += 1
+    else if (m.visits >= 2) freqBucket.casual += 1
+    else freqBucket.once += 1
+  })
+  const customersOut = {
+    today: loyaltyMembers.filter((m) => m.lastVisitAt >= dayAgo).length,
+    week: loyaltyMembers.filter((m) => m.lastVisitAt >= weekAgo).length,
+    month: loyaltyMembers.filter((m) => m.lastVisitAt >= monthAgo).length,
+    year: loyaltyMembers.filter((m) => m.lastVisitAt >= yearAgo).length,
+    lifetime: loyaltyMembers.length,
+    inWindow: windowPhones.size,
+    newInWindow,
+    returningInWindow,
+    guestOrders: orders.filter((o) => !o.loyaltyPhone).length,
+    frequency: freqBucket,
+    topSpenders: [...loyaltyMembers]
+      .sort((a, b) => b.totalSpent - a.totalSpent)
+      .slice(0, 10)
+      .map((m) => ({
+        name: m.name || m.phone,
+        phone: m.phone,
+        visits: m.visits,
+        totalSpent: m.totalSpent,
+        avgBill: m.visits ? Math.round(m.totalSpent / m.visits) : 0,
+        points: m.points,
+      })),
+  }
+
+  // ── Fulfilment speed: created → served, ETA overruns ──
+  const servedDurations = completed
+    .map((o) => (o.updatedAt.getTime() - o.createdAt.getTime()) / 60000)
+    .filter((m) => m > 0 && m < 360) // ignore stale orders left open across days
+  const avgFulfilMinutes = servedDurations.length
+    ? Math.round(servedDurations.reduce((s, m) => s + m, 0) / servedDurations.length)
+    : 0
+  const delayed = completed.filter((o) => {
+    const mins = (o.updatedAt.getTime() - o.createdAt.getTime()) / 60000
+    return mins > 0 && mins < 360 && mins > (o.etaMinutes || 0) + 10
+  }).length
+  const fulfilment = {
+    avgMinutes: avgFulfilMinutes,
+    avgEta: completed.length ? Math.round(sum(completed, (o) => o.etaMinutes) / completed.length) : 0,
+    delayedOrders: delayed,
+  }
+
+  // ── Feedback: averages, star distribution, naive sentiment ──
+  const ratingAvg = (key) =>
+    ratings.length ? Math.round((sum(ratings, (r) => r[key]) / ratings.length) * 10) / 10 : 0
+  const distribution = [1, 2, 3, 4, 5].map((star) => ({
+    star,
+    count: ratings.filter((r) => r.overall === star).length,
+  }))
+  const ratingsOut = {
+    count: ratings.length,
+    food: ratingAvg('food'),
+    service: ratingAvg('service'),
+    overall: ratingAvg('overall'),
+    distribution,
+    positive: ratings.filter((r) => r.overall >= 4).length,
+    neutral: ratings.filter((r) => r.overall === 3).length,
+    negative: ratings.filter((r) => r.overall > 0 && r.overall <= 2).length,
+    comments: ratings
+      .filter((r) => r.comments)
+      .slice(0, 6)
+      .map((r) => ({ comments: r.comments, overall: r.overall, createdAt: r.createdAt.toISOString() })),
+  }
+
+  // ── Inventory (dishes with stock tracking on) ──
+  const tracked = dishes.filter((d) => d.trackStock)
+  const inventory = {
+    tracked: tracked.length,
+    lowStock: tracked
+      .filter((d) => d.stock > 0 && d.stock <= d.lowStockAt)
+      .map((d) => ({ name: d.name, stock: d.stock, lowStockAt: d.lowStockAt })),
+    outOfStock: tracked.filter((d) => d.stock <= 0).map((d) => ({ name: d.name })),
+    stockValue: sum(tracked, (d) => d.stock * d.price),
+  }
+
+  const expensesByCategory = expenses.reduce((acc, e) => {
+    acc[e.category] = (acc[e.category] || 0) + e.amount
+    return acc
+  }, {})
+
+  res.json({
+    range: { from: fromDate.toISOString(), to: toDate.toISOString(), days },
+    prevRange: { from: prevFrom.toISOString(), to: prevTo.toISOString() },
+    org: {
+      currencySymbol: org?.currencySymbol || '₹',
+      taxLabel: org?.taxLabel || 'GST',
+      gstRate: orgGst,
+      timezone: tz,
+      roomServiceEnabled: !!org?.roomOrderingEnabled,
+    },
+    totals,
+    prevTotals,
+    daily,
+    hourly,
+    heatmap,
+    weekdays: WEEKDAYS,
+    statusCounts,
+    dishes: dishesOut,
+    categories: categoriesOut,
+    gst: {
+      total: totals.tax,
+      byCategory: categoriesOut.map((c) => ({ name: c.name, gst: c.gst })),
+      byDish: [...allDishStats].sort((a, b) => b.gst - a.gst).slice(0, 10).map((d) => ({ name: d.name, gst: d.gst })),
+    },
+    payments,
+    serviceMix,
+    tables: tablesOut,
+    rooms: roomsOut,
+    customers: customersOut,
+    fulfilment,
+    ratings: ratingsOut,
+    inventory,
+    expensesByCategory,
   })
 }))
 

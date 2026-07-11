@@ -202,6 +202,10 @@ model Dish {
   categoryId     String
   category       Category @relation(fields: [categoryId], references: [id])
   price          Int
+  // What the dish costs the kitchen to make (ingredients + packaging), in the
+  // same currency unit as price. NULL = not set; profit reports skip the dish
+  // rather than assume a 100% margin.
+  costPrice      Int?
   image          String   @default("")
   isVeg          Boolean  @default(true)
   spice          Int      @default(0)
@@ -307,6 +311,10 @@ model OrderItem {
   dishId       String
   name         String
   price        Int
+  // Snapshot of the dish's costPrice at order time, like `price` — so profit
+  // history stays correct when the menu's costs are edited later. NULL for
+  // orders placed before costing existed or dishes without a cost set.
+  costPrice    Int?
   qty          Int
   instructions String @default("")
 }
