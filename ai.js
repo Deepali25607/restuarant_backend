@@ -72,7 +72,10 @@ function checkRateLimit(orgId) {
 // messages: [{ role: 'user' | 'assistant', text }]
 // When json=true the model is forced to emit application/json and the parsed
 // object is returned; otherwise the raw text is.
-async function generate({ system, messages, json = false, temperature = 0.6, maxOutputTokens = 1024 }) {
+// Note: current flash models are "thinking" models whose reasoning tokens
+// count against maxOutputTokens, so the cap needs generous headroom or the
+// visible reply gets truncated (finishReason MAX_TOKENS → broken JSON).
+async function generate({ system, messages, json = false, temperature = 0.6, maxOutputTokens = 4096 }) {
   if (!enabled()) {
     throw new AiError('AI is not configured. Set GEMINI_API_KEY on the server.', 503)
   }
@@ -90,7 +93,6 @@ async function generate({ system, messages, json = false, temperature = 0.6, max
     },
   }
 
-  let data = null
   let lastError = null
   for (let i = startIdx(); i < MODEL_CHAIN.length; i++) {
     const model = MODEL_CHAIN[i]
@@ -111,34 +113,53 @@ async function generate({ system, messages, json = false, temperature = 0.6, max
       continue
     }
 
-    if (res.ok) {
-      data = await res.json()
-      workingIdx = i
-      workingIdxAt = Date.now()
-      break
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '')
+      // 404 = model retired for this key, 429 = per-model quota, 503 = demand
+      // spike. All three are model-specific on the free tier — fall through.
+      if ([404, 429, 503].includes(res.status)) {
+        lastError =
+          res.status === 429
+            ? new AiError('The AI assistant hit its usage limit — please try again shortly.', 429)
+            : new AiError(`AI request failed (${res.status}): ${detail.slice(0, 300)}`)
+        continue
+      }
+      throw new AiError(`AI request failed (${res.status}): ${detail.slice(0, 300)}`)
     }
 
-    const detail = await res.text().catch(() => '')
-    // 404 = model retired for this key, 429 = per-model quota, 503 = demand
-    // spike. All three are model-specific on the free tier — fall through.
-    if ([404, 429, 503].includes(res.status)) {
-      lastError =
-        res.status === 429
-          ? new AiError('The AI assistant hit its usage limit — please try again shortly.', 429)
-          : new AiError(`AI request failed (${res.status}): ${detail.slice(0, 300)}`)
+    const data = await res.json()
+    // Skip thought parts (thinking models may return them) and keep only the
+    // visible reply text.
+    const text = (data.candidates?.[0]?.content?.parts || [])
+      .filter((p) => !p.thought)
+      .map((p) => p.text || '')
+      .join('')
+      .trim()
+
+    // Empty or truncated output (usually the thinking budget eating the whole
+    // token cap, finishReason MAX_TOKENS) is model-specific too — fall through
+    // to the next model instead of failing the request.
+    if (!text) {
+      lastError = new AiError('The AI returned an empty response — please try again.')
       continue
     }
-    throw new AiError(`AI request failed (${res.status}): ${detail.slice(0, 300)}`)
-  }
-  if (!data) throw lastError || new AiError('All AI models are unavailable right now — please try again shortly.')
-  const text = (data.candidates?.[0]?.content?.parts || [])
-    .map((p) => p.text || '')
-    .join('')
-    .trim()
-  if (!text) throw new AiError('The AI returned an empty response — please try again.')
+    let out = text
+    if (json) {
+      try {
+        out = parseJson(text)
+      } catch (err) {
+        lastError = err
+        continue
+      }
+    }
 
-  if (!json) return text
-  return parseJson(text)
+    // Only remember a model as "working" once it produced a usable response,
+    // so a model that 200s with broken output doesn't get pinned.
+    workingIdx = i
+    workingIdxAt = Date.now()
+    return out
+  }
+  throw lastError || new AiError('All AI models are unavailable right now — please try again shortly.')
 }
 
 // Gemini occasionally wraps JSON in markdown fences even in JSON mode.
